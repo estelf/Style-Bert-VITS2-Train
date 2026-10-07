@@ -1,23 +1,19 @@
+"""前処理の一括実行CLI。データセットの初期化〜特徴量生成（Step 1〜6）をモデル名を明示して実行する。
+
+学習自体は別のコマンド（`train_model.py -m <モデル名>`）で行う。各段階は冪等で、順序や他のコマンドの実行履歴に依存しない。
+"""
+
 import argparse
 from multiprocessing import cpu_count
 
-from gradio_tabs.train import preprocess_all
-from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
-from style_bert_vits2.nlp.japanese.user_dict import update_dict
-
-
-# このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
-pyopenjtalk_worker.initialize_worker()
-
-# dict_data/ 以下の辞書データを pyopenjtalk に適用
-update_dict()
+from preprocess import preprocess_all
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model_name", "-m", type=str, help="Model name", required=True
     )
-    parser.add_argument("--batch_size", "-b", type=int, help="Batch size", default=2)
+    parser.add_argument("--batch_size", "-b", type=int, help="Batch size", default=4)
     parser.add_argument("--epochs", "-e", type=int, help="Epochs", default=100)
     parser.add_argument(
         "--save_every_steps",
@@ -33,49 +29,18 @@ if __name__ == "__main__":
         default=cpu_count() // 2,
     )
     parser.add_argument(
-        "--normalize",
-        action="store_true",
-        help="Loudness normalize audio",
+        "--freeze_JP_bert", action="store_true", help="Freeze JP BERT", default=True
     )
     parser.add_argument(
-        "--trim",
-        action="store_true",
-        help="Trim silence",
+        "--freeze_style", action="store_true", help="Freeze style vector", default=False
     )
     parser.add_argument(
-        "--freeze_EN_bert",
-        action="store_true",
-        help="Freeze English BERT",
-    )
-    parser.add_argument(
-        "--freeze_JP_bert",
-        action="store_true",
-        help="Freeze Japanese BERT",
-    )
-    parser.add_argument(
-        "--freeze_ZH_bert",
-        action="store_true",
-        help="Freeze Chinese BERT",
-    )
-    parser.add_argument(
-        "--freeze_style",
-        action="store_true",
-        help="Freeze style vector",
-    )
-    parser.add_argument(
-        "--freeze_decoder",
-        action="store_true",
-        help="Freeze decoder",
-    )
-    parser.add_argument(
-        "--use_jp_extra",
-        action="store_true",
-        help="Use JP-Extra model",
+        "--freeze_decoder", action="store_true", help="Freeze decoder", default=False
     )
     parser.add_argument(
         "--val_per_lang",
         type=int,
-        help="Validation per language",
+        help="Validation per speaker",
         default=0,
     )
     parser.add_argument(
@@ -90,6 +55,13 @@ if __name__ == "__main__":
         help="Yomi error. Options: raise, skip, use",
         default="raise",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["float32", "bfloat16"],
+        help="学習時の計算精度（config.json の train.dtype に書き込まれる。既定 float32。fp16 は学習に使えないため選択不可）",
+        default="float32",
+    )
 
     args = parser.parse_args()
 
@@ -99,15 +71,11 @@ if __name__ == "__main__":
         epochs=args.epochs,
         save_every_steps=args.save_every_steps,
         num_processes=args.num_processes,
-        normalize=args.normalize,
-        trim=args.trim,
-        freeze_EN_bert=args.freeze_EN_bert,
         freeze_JP_bert=args.freeze_JP_bert,
-        freeze_ZH_bert=args.freeze_ZH_bert,
         freeze_style=args.freeze_style,
         freeze_decoder=args.freeze_decoder,
-        use_jp_extra=args.use_jp_extra,
         val_per_lang=args.val_per_lang,
         log_interval=args.log_interval,
         yomi_error=args.yomi_error,
+        dtype=args.dtype,
     )

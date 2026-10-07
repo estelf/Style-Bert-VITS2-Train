@@ -1,14 +1,15 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
 
 [project]
 name = "style-bert-vits2"
-dynamic = ["version"]
-description = "Style-Bert-VITS2: Bert-VITS2 with more controllable voice styles."
+# uv_build は動的バージョン非対応のため静的指定（style_bert_vits2/constants.py の VERSION と必ず揃える）
+version = "2.7.0"
+description = "Style-Bert-VITS2: Bert-VITS2 with more controllable voice styles. (Japanese-only learning core)"
 readme = "README.md"
-requires-python = ">=3.9"
-license = "AGPL-3.0"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"  # SPDX表記（旧: AGPL-3.0）
 keywords = []
 authors = [
     { name = "litagin02", email = "139731664+litagin02@users.noreply.github.com" },
@@ -16,34 +17,40 @@ authors = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
-    "cmudict",
-    "cn2an",
-    "g2p_en",
-    "jieba",
+    "accelerate",
+    "gradio>=5.0",
+    "librosa",
     "loguru",
-    "nltk<=3.8.1",
-    "num2words",
     "numba",
-    "numpy<2",
-    "onnxruntime",
+    "num2words",
+    "numpy>=2",  # pyannote.audio 4.x が numpy>=2 を要求する。pyopenjtalk-dict はホイールが numpy 1.x ABI 前提のため [tool.uv] でソースビルドしている
+    "pyannote.audio>=4.0.7",
     "pydantic>=2.0",
     "pyopenjtalk-dict",
-    "pypinyin",
     "pyworld-prebuilt",
     "safetensors",
+    "setuptools<81",  # pyopenjtalk-dict が pkg_resources を使うため（81以降では削除された）
+    "tensorboard",
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "tqdm",
     "transformers",
 ]
 
 [project.optional-dependencies]
-torch = [
-    "accelerate",
-    "torch>=2.1",
+# スタイルベクトルの可視化・クラスタリング用 (gradio_tabs/style_vectors.py)
+style-vectors = [
+    "matplotlib",
+    "scikit-learn",
+    "umap-learn",
 ]
 
 [project.urls]
@@ -51,90 +58,38 @@ Documentation = "https://github.com/litagin02/Style-Bert-VITS2#readme"
 Issues = "https://github.com/litagin02/Style-Bert-VITS2/issues"
 Source = "https://github.com/litagin02/Style-Bert-VITS2"
 
-[tool.hatch.version]
-path = "style_bert_vits2/constants.py"
-
-[tool.hatch.build.targets.sdist]
-only-include = [
-    ".vscode",
+[tool.uv.build-backend]
+# フラットレイアウトで style_bert_vits2/ をそのままパッケージ化する（デフォルトの src/  layout ではない）
+module-name = "style_bert_vits2"
+module-root = ""
+# ソース配布物に含める追加ファイル（コアライブラリ本体以外のリポジトリ資産。LICENSE 等はデフォルトで含まれる）
+source-include = [
+    ".vscode/**",
     "dict_data/default.csv",
-    "docs",
-    "style_bert_vits2",
-    "tests",
+    "docs/**",
+    "tests/**",
     "LGPL_LICENSE",
     "LICENSE",
-    "pyproject.toml",
-    "README.md",
 ]
-exclude = [".git", ".gitignore", ".gitattributes"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["style_bert_vits2"]
+[tool.uv]
+# torch 等は PyPI の CUDA ビルドがそのまま入る（必要なら cu12x index を使うこと）
+# pyopenjtalk-dict はホイールが numpy 1.x ABI でビルドされているため、numpy 2 環境では
+# ソースからビルドする（環境構築時に1回だけ発生し、cmake/cython は下のビルド制約で入る。
+# cython は 3.1 以上が必要: 0.29 系で生成した C++ は Python 3.13 の C API でコンパイルできない）
+no-binary-package = ["pyopenjtalk-dict"]
+build-constraint-dependencies = ["cmake<4", "cython>=3.1", "setuptools<81"]
 
-# for PyTorch inference
-[tool.hatch.envs.test]
-dependencies = [
+[dependency-groups]
+dev = [
     "coverage[toml]>=6.5",
     "pytest",
     "scipy",
 ]
-features = ["torch"]
-[tool.hatch.envs.test.scripts]
-# Usage: `hatch run test:test`
-test = "pytest -s tests/test_main.py::test_synthesize_cpu"
-# Usage: `hatch run test:test-cuda`
-test-cuda = "pytest -s tests/test_main.py::test_synthesize_cuda"
-# Usage: `hatch run test:coverage`
-test-cov = "coverage run -m pytest -s tests/test_main.py::test_synthesize_cpu"
-# Usage: `hatch run test:cov-report`
-cov-report = ["- coverage combine", "coverage report"]
-# Usage: `hatch run test:cov`
-cov = ["test-cov", "cov-report"]
-[[tool.hatch.envs.test.matrix]]
-python = ["3.9", "3.10", "3.11"]
 
-# for ONNX inference (without PyTorch dependency)
-[tool.hatch.envs.test-onnx]
-dependencies = [
-    "coverage[toml]>=6.5",
-    "pytest",
-    "scipy",
-    "onnxruntime-directml; sys_platform == 'win32'",
-    "onnxruntime-gpu; sys_platform != 'darwin'",
-]
-[tool.hatch.envs.test-onnx.scripts]
-# Usage: `hatch run test-onnx:test`
-test = "pytest -s tests/test_main.py::test_synthesize_onnx_cpu"
-# Usage: `hatch run test-onnx:test-cuda`
-test-cuda = "pytest -s tests/test_main.py::test_synthesize_onnx_cuda"
-# Usage: `hatch run test-onnx:test-directml`
-test-directml = "pytest -s tests/test_main.py::test_synthesize_onnx_directml"
-# Usage: `hatch run test-onnx:test-coreml`
-test-coreml = "pytest -s tests/test_main.py::test_synthesize_onnx_coreml"
-# Usage: `hatch run test-onnx:coverage`
-test-cov = "coverage run -m pytest -s tests/test_main.py::test_synthesize_onnx_cpu"
-# Usage: `hatch run test-onnx:cov-report`
-cov-report = ["- coverage combine", "coverage report"]
-# Usage: `hatch run test-onnx:cov`
-cov = ["test-cov", "cov-report"]
-[[tool.hatch.envs.test-onnx.matrix]]
-python = ["3.9", "3.10", "3.11"]
-
-[tool.hatch.envs.style]
-detached = true
-dependencies = ["black[jupyter]", "isort"]
-[tool.hatch.envs.style.scripts]
-# Usage: `hatch run style:check`
-check = [
-    "black --check --diff .",
-    "isort --check-only --diff --profile black --gitignore --lai 2 . --sg \"Data/*\" --sg \"inputs/*\" --sg \"model_assets/*\" --sg \"static/*\"",
-]
-# Usage: `hatch run style:fmt`
-fmt = [
-    "black .",
-    "isort --profile black --gitignore --lai 2 . --sg \"Data/*\" --sg \"inputs/*\" --sg \"model_assets/*\" --sg \"static/*\"",
-    "check",
-]
+[tool.pytest.ini_options]
+addopts = "-s"
+testpaths = ["tests"]
 
 [tool.coverage.run]
 source_pkgs = ["style_bert_vits2", "tests"]

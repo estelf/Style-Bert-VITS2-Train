@@ -1,36 +1,40 @@
+import os
 from pathlib import Path
 
 from style_bert_vits2.utils.strenum import StrEnum
 
 
-# Style-Bert-VITS2 のバージョン
+# Style-Bert-VITS2 のバージョン（pyproject.toml の [project].version と必ず揃える）
 VERSION = "2.7.0"
 
 # Style-Bert-VITS2 のベースディレクトリ
 BASE_DIR = Path(__file__).parent.parent
 
+# 学習データセットのルート（{DATASET_ROOT}/{model_name} に esd.list + raw.zip を置く）
+## 環境変数 SBV2_DATASET_ROOT で差し替え可能（回帰テストは tests/data を使う。サブプロセスも同じ環境変数を継承する）
+DATASET_ROOT = Path(os.environ.get("SBV2_DATASET_ROOT", str(BASE_DIR / "Data")))
+
+# 学習済みモデル資産のルート（学習時は {ASSETS_ROOT}/{model_name} に保存し、推論時はここから読み込む）
+ASSETS_ROOT = BASE_DIR / "model_assets"
+
+# 学習時の分散環境変数のデフォルト（環境変数が未設定の場合に pipeline が使用。上書きしたい場合は環境変数を直接指定）
+TRAIN_ENV_DEFAULTS = {
+    "MASTER_ADDR": "::1",  # IPv6ループバック（WSL2 mirrored mode でも確実にbind/connectできるため localhost でなくリテラル指定）
+    "MASTER_PORT": "10086",
+    "WORLD_SIZE": "1",
+    "RANK": "0",
+    "LOCAL_RANK": "0",
+}
+
 
 # 利用可能な言語
-## JP-Extra モデル利用時は JP 以外の言語の音声合成はできない
+## 本リポジトリは日本語のみに対応する（英語はカタカナ入力が前提。ローマ字のままの英単語は pyopenjtalk に1文字ずつ読まれるため、ユーザー辞書で吸収するかカタカナで書く運用とする）
 class Languages(StrEnum):
     JP = "JP"
-    EN = "EN"
-    ZH = "ZH"
 
 
-# 言語ごとのデフォルトの BERT モデルのパス
-DEFAULT_BERT_MODEL_PATHS = {
-    Languages.JP: BASE_DIR / "bert" / "deberta-v2-large-japanese-char-wwm",
-    Languages.EN: BASE_DIR / "bert" / "deberta-v3-large",
-    Languages.ZH: BASE_DIR / "bert" / "chinese-roberta-wwm-ext-large",
-}
-
-# 言語ごとのデフォルトの BERT モデル (ONNX 版) のパス
-DEFAULT_ONNX_BERT_MODEL_PATHS = {
-    Languages.JP: BASE_DIR / "bert" / "deberta-v2-large-japanese-char-wwm-onnx",
-    Languages.EN: BASE_DIR / "bert" / "deberta-v3-large-onnx",
-    Languages.ZH: BASE_DIR / "bert" / "chinese-roberta-wwm-ext-large-onnx",
-}
+# 日本語 BERT モデルのデフォルトパス
+DEFAULT_BERT_MODEL_PATH = BASE_DIR / "pretrained" / "bert" / "deberta-v2-large-japanese-char-wwm"
 
 # デフォルトのユーザー辞書ディレクトリ
 ## style_bert_vits2.nlp.japanese.user_dict モジュールのデフォルト値として利用される

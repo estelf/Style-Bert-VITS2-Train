@@ -7,6 +7,7 @@ import pyopenjtalk
 
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_common import (
+    PROTOCOL_MAGIC,
     ConnectionClosedException,
     RequestType,
     receive_data,
@@ -47,6 +48,7 @@ class WorkerServer:
             if request_type == RequestType.STATUS:
                 response = {
                     "success": True,
+                    "protocol": PROTOCOL_MAGIC,
                     "client-count": self.client_count,
                 }
             elif request_type == RequestType.QUIT_SERVER:
@@ -72,7 +74,7 @@ class WorkerServer:
         logger.info("start pyopenjtalk worker server")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((socket.gethostname(), port))
+            server_socket.bind(("localhost", port))  # WSL2 mirrored network 等を考慮し、hostname でなく明示的に localhost に bind する
             server_socket.listen()
             sockets = [server_socket]
             no_client_since = time.time()

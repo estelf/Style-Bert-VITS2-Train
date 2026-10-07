@@ -1,7 +1,6 @@
 import re
 from typing import TypedDict
 
-from style_bert_vits2.constants import Languages
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp import bert_models
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker as pyopenjtalk
@@ -11,7 +10,7 @@ from style_bert_vits2.nlp.symbols import PUNCTUATIONS
 
 
 def g2p(
-    norm_text: str, use_jp_extra: bool = True, raise_yomi_error: bool = False
+    norm_text: str, raise_yomi_error: bool = False
 ) -> tuple[list[str], list[int], list[int]]:
     """
     他で使われるメインの関数。`normalize_text()` で正規化された `norm_text` を受け取り、
@@ -23,7 +22,6 @@ def g2p(
 
     Args:
         norm_text (str): 正規化されたテキスト
-        use_jp_extra (bool, optional): False の場合、「ん」の音素を「N」ではなく「n」とする。Defaults to True.
         raise_yomi_error (bool, optional): False の場合、読めない文字が「'」として発音される。Defaults to False.
 
     Returns:
@@ -63,7 +61,7 @@ def g2p(
     for i in sep_text:
         if i not in PUNCTUATIONS:
             sep_tokenized.append(
-                bert_models.load_tokenizer(Languages.JP).tokenize(i)
+                bert_models.load_tokenizer().tokenize(i)
             )  # ここでおそらく`i`が文字単位に分割される
         else:
             sep_tokenized.append([i])
@@ -83,10 +81,6 @@ def g2p(
     tones = [tone for _, tone in phone_tone_list]
 
     assert len(phones) == sum(word2ph), f"{len(phones)} != {sum(word2ph)}"
-
-    # use_jp_extra でない場合は「N」を「n」に変換
-    if not use_jp_extra:
-        phones = [phone if phone != "N" else "n" for phone in phones]
 
     return phones, tones, word2ph
 

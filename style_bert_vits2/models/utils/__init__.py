@@ -159,17 +159,19 @@ def load_wav_to_torch(full_path: Union[str, Path]) -> tuple[torch.FloatTensor, i
 
     Returns:
         tuple[torch.FloatTensor, int]: 音声データのテンソルとサンプリングレート
+            テンソルは soundfile により ±1 に正規化済み（scipy.io.wavfile のように生サンプルではないことに注意）
     """
 
     # この関数は学習時以外使われないため、ライブラリとしての style_bert_vits2 が
-    # 重たい scipy に依存しないように遅延 import する
+    # 重量級ライブラリに依存しないように遅延 import する
+    # scipy.io.wavfile は RIFF/WAV しか読めないが、soundfile は flac などにも対応している
     try:
-        from scipy.io.wavfile import read
+        import soundfile as sf
     except ImportError:
-        raise ImportError("scipy is required to load wav file")
+        raise ImportError("soundfile is required to load audio file")
 
-    sampling_rate, data = read(full_path)
-    return torch.FloatTensor(data.astype(np.float32)), sampling_rate
+    data, sampling_rate = sf.read(full_path, dtype="float32")
+    return torch.from_numpy(np.ascontiguousarray(data)), sampling_rate
 
 
 def load_filepaths_and_text(
