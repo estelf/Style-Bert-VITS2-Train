@@ -128,26 +128,21 @@ def text_to_sep_kata(
         処理すべきは `yomi` が `、` の場合のみのはず。
         """
         assert yomi != "", f"Empty yomi: {word}"
-        if yomi == "、":
+        if set(word).issubset(set(PUNCTUATIONS)):
             # word は正規化されているので、`.`, `,`, `!`, `'`, `-`, `--` のいずれか
-            if not set(word).issubset(set(PUNCTUATIONS)):  # 記号繰り返しか判定
-                # ここは pyopenjtalk が読めない文字等のときに起こる
-                ## 例外を送出する場合
-                if raise_yomi_error:
-                    raise YomiError(f"Cannot read: {word} in:\n{norm_text}")
-                ## 例外を送出しない場合
-                ## 読めない文字は「'」として扱う
-                logger.warning(
-                    f'Cannot read: {word} in:\n{norm_text}, replaced with "\'"'
-                )
-                # word の文字数分「'」を追加
-                yomi = "'" * len(word)
-            else:
-                # yomi は元の記号のままに変更
-                yomi = word
-        elif yomi == "？":
-            assert word == "?", f"yomi `？` comes from: {word}"
-            yomi = "?"
+            # pyopenjtalk-plus では pron に全角の `！` 等がそのまま返るため、yomi ではなく word 側で判定する
+            # （yomi は元の記号のままに変更）
+            yomi = word
+        elif yomi == "、":
+            # ここは pyopenjtalk が読めない文字等のときに起こる
+            ## 例外を送出する場合
+            if raise_yomi_error:
+                raise YomiError(f"Cannot read: {word} in:\n{norm_text}")
+            ## 例外を送出しない場合
+            ## 読めない文字は「'」として扱う
+            logger.warning(f'Cannot read: {word} in:\n{norm_text}, replaced with "\'"')
+            # word の文字数分「'」を追加
+            yomi = "'" * len(word)
         sep_text.append(word)
         sep_kata.append(yomi)
 
