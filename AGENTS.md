@@ -19,7 +19,7 @@
 
 ## ビルド・テストの癖
 
-- `pyopenjtalk-dict` はホイールが numpy 1.x ABI 前提のためソースビルド必須（`[tool.uv]` の no-binary-package / cython>=3.1 制約で担保済み）。GPU 環境では `uv sync` 前後に OS/CUDA に応じた torch を別途入れる（例: `uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl/cu128`）。
+- G2P は `pyopenjtalk-plus`（numpy 2.x 向け事前ビルド済み wheel あり。旧 pyopenjtalk-dict 必要だったソースビルド/cmake/setuptools<81 制約は不要）。`[tsqyomi]` 追加で同形異音語の文脈読み選択、`[onnxruntime]` 追加で「何」読み推定が有効になる。GPU 環境では `uv sync` 前後に OS/CUDA に応じた torch を別途入れる（例: `uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl/cu128`）。
 - 回帰テスト: `uv run pytest -v`（前処理→シード固定42の1エポック学習→合成→ゴールデン音声との相関差分検知。品質検証ではなく契約チェック）。
   - テストデータセット・ゴールデン音声は git に含まれない。`tests/data/<モデル名>/` に配置しないとテストは skip される（clone 直後は存在しないのが正常）。デフォルトは `SBV2_TEST_MODEL=model_1`、差し替えは環境変数で。ゴールデン（`tests/references/`）は初回実行時に自動作成される。
 - リンターは ruff（isort ルール "I" のみ拡張、dev 依存には未導入なので `uvx ruff check .` 等で実行）。フォーマットは black（VSCode 設定由来）。
