@@ -117,7 +117,15 @@ def rational_quadratic_spline(
     min_derivative: float = DEFAULT_MIN_DERIVATIVE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
-    if torch.min(inputs) < left or torch.max(inputs) > right:
+    # フルFP16推論対応：半精度のままでは3次方程式求解（判別式）が数値不安定なため、内部計算のみ float32 に提升し、結果は元の dtype で返す
+    out_dtype = inputs.dtype
+    if out_dtype == torch.float16:
+        inputs = inputs.float()
+        unnormalized_widths = unnormalized_widths.float()
+        unnormalized_heights = unnormalized_heights.float()
+        unnormalized_derivatives = unnormalized_derivatives.float()
+
+    if inputs.numel() > 0 and (torch.min(inputs) < left or torch.max(inputs) > right):
         raise ValueError("Input to a transform is not within its domain")
 
     num_bins = unnormalized_widths.shape[-1]
@@ -174,7 +182,11 @@ def rational_quadratic_spline(
         c = -input_delta * (inputs - input_cumheights)
 
         discriminant = b.pow(2) - 4 * a * c
-        assert (discriminant >= 0).all()
+        if out_dtype == torch.float16:
+            # 半精度で計算された入力に由来する微小な負値（丸め誤差）は 0 として扱う
+            discriminant = discriminant.clamp_min(0)
+        else:
+            assert (discriminant >= 0).all()
 
         root = (2 * c) / (-b - torch.sqrt(discriminant))
         outputs = root * input_bin_widths + input_cumwidths
@@ -191,7 +203,7 @@ def rational_quadratic_spline(
         )
         logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
 
-        return outputs, -logabsdet
+        return outputs.to(out_dtype), (-logabsdet).to(out_dtype)
     else:
         theta = (inputs - input_cumwidths) / input_bin_widths
         theta_one_minus_theta = theta * (1 - theta)
@@ -212,4 +224,4 @@ def rational_quadratic_spline(
         )
         logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
 
-        return outputs, logabsdet
+        return outputs.to(out_dtype), logabsdet.to(out_dtype)

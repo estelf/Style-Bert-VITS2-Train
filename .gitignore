@@ -8,29 +8,19 @@ dist/
 .DS_Store
 ._*
 
-/*.yml
-!/default_config.yml
-/bert/*/*.bin
-/bert/*/*.h5
-/bert/*/*.model
-/bert/*/*.safetensors
-/bert/*/*.msgpack
-/bert/*/*.onnx
+/pretrained/bert/*/*.bin
+/pretrained/bert/*/*.h5
+/pretrained/bert/*/*.model
+/pretrained/bert/*/*.safetensors
+/pretrained/bert/*/*.msgpack
+/pretrained/bert/*/*.onnx
 
-/configs/paths.yml
 
-/pretrained/*.safetensors
-/pretrained/*.pth
+/pretrained/jp_extra/*.safetensors
+/pretrained/jp_extra/*.pth
 
-/pretrained_jp_extra/*.safetensors
-/pretrained_jp_extra/*.pth
+/pretrained/slm/*/*.bin
 
-/slm/*/*.bin
-
-/scripts/test/
-/scripts/lib/
-/scripts/Style-Bert-VITS2/
-/scripts/sbv2/
 *.zip
 *.csv
 *.bak

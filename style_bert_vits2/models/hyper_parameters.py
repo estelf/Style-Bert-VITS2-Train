@@ -19,8 +19,7 @@ class HyperParametersTrain(BaseModel):
     betas: tuple[float, float] = (0.8, 0.99)
     eps: float = 1e-9
     batch_size: int = 2
-    bf16_run: bool = False
-    fp16_run: bool = False
+    dtype: str = "float32"  # 学習時の計算精度 ("float32" / "bfloat16")。既定 float32（upstream 既定に合わせ。allow_tf32/TF32 が有効なため bf16 の速度メリットが無いに等しい）。fp16 は動的範囲が足りず（アテンションスコアが溢れ全ステップスキップになる）ため非対応
     lr_decay: float = 0.99996
     segment_size: int = 16384
     init_lr_ratio: int = 1
@@ -29,17 +28,15 @@ class HyperParametersTrain(BaseModel):
     c_kl: float = 1.0
     c_commit: int = 100
     skip_optimizer: bool = False
-    freeze_ZH_bert: bool = False
     freeze_JP_bert: bool = False
-    freeze_EN_bert: bool = False
     freeze_emo: bool = False
     freeze_style: bool = False
     freeze_decoder: bool = False
+    keep_ckpts: int = 1  # 0 で全チェックポイント保持
+    spec_cache: bool = True  # スペクトルキャッシュ（.spec.pt）を使うか
 
 
 class HyperParametersData(BaseModel):
-    # use_jp_extra フィールドが存在しない旧モデルとの互換性のために False をデフォルト値とする
-    use_jp_extra: bool = False
     training_files: str = "Data/Dummy/train.list"
     validation_files: str = "Data/Dummy/val.list"
     max_wav_value: float = 32768.0
@@ -63,7 +60,7 @@ class HyperParametersData(BaseModel):
 
 
 class HyperParametersModelSLM(BaseModel):
-    model: str = "./slm/wavlm-base-plus"
+    model: str = "./pretrained/slm/wavlm-base-plus"
     sr: int = 16000
     hidden: int = 768
     nlayers: int = 13
@@ -108,6 +105,8 @@ class HyperParameters(BaseModel):
 
     # 以下は学習時にのみ動的に設定されるパラメータ (通常 config.json には存在しない)
     model_dir: Optional[str] = None
+    out_dir: Optional[str] = None
+    dataset_path: Optional[str] = None
     speedup: bool = False
     repo_id: Optional[str] = None
 

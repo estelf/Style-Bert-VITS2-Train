@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import gc
 import time
-from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
-import onnxruntime
 from numpy.typing import NDArray
 from pydantic import BaseModel, Field
 
@@ -21,7 +19,6 @@ from style_bert_vits2.constants import (
     DEFAULT_SPLIT_INTERVAL,
     DEFAULT_STYLE,
     DEFAULT_STYLE_WEIGHT,
-    Languages,
 )
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
@@ -29,10 +26,7 @@ from style_bert_vits2.voice import adjust_voice
 
 
 if TYPE_CHECKING:
-    from style_bert_vits2.models.models import SynthesizerTrn
-    from style_bert_vits2.models.models_jp_extra import (
-        SynthesizerTrn as SynthesizerTrnJPExtra,
-    )
+    from style_bert_vits2.models.models_jp_extra import SynthesizerTrn
 
 
 class NullModelParam(BaseModel):
@@ -61,29 +55,26 @@ class TTSModel:
         config_path: Union[Path, HyperParameters],
         style_vec_path: Union[Path, NDArray[Any]],
         device: str = "cpu",
-        onnx_providers: Sequence[Union[str, tuple[str, dict[str, Any]]]] = [("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"})],
-    ) -> None:  # fmt: skip
+        dtype: str = "float16",
+    ) -> None:
         """
         Style-Bert-VITS2 の音声合成モデルを初期化する。
         この時点ではモデルはロードされていない (明示的にロードしたい場合は model.load() を呼び出す)。
 
         Args:
-            model_path (Path): モデル (.safetensors / .onnx) のパス
+            model_path (Path): モデル (.safetensors) のパス
             config_path (Union[Path, HyperParameters]): ハイパーパラメータ (config.json) のパス (直接 HyperParameters を指定することも可能)
             style_vec_path (Union[Path, NDArray[Any]]): スタイルベクトル (style_vectors.npy) のパス (直接 NDArray を指定することも可能)
-            device (str): PyTorch 推論での音声合成時に利用するデバイス (cpu, cuda, mps など)
-            onnx_providers (list[str]): ONNX 推論で利用する ExecutionProvider (CPUExecutionProvider, CUDAExecutionProvider など)
+            device (str): 音声合成時に利用するデバイス (cpu, cuda, mps など)
+            dtype (str): 音声合成時に利用する重みの精度。既定の "float16"（フル半精度推論）または "float32"。
+                なお bfloat16 は仮数が8ビットしかなく、duration の ceil() 量子化と組み合わせて精度劣化が大きいため推論では非対応（学習は float32/bfloat16）。
         """
 
         self.model_path: Path = model_path
         self.device: str = device
-        self.onnx_providers: Sequence[Union[str, tuple[str, dict[str, Any]]]] = onnx_providers  # fmt: skip
-
-        # ONNX 形式のモデルかどうか
-        if self.model_path.suffix == ".onnx":
-            self.is_onnx_model = True
-        else:
-            self.is_onnx_model = False
+        if dtype not in ("float32", "float16"):
+            raise ValueError(f"Unsupported dtype: {dtype}")
+        self.dtype: str = dtype
 
         # ハイパーパラメータの Pydantic モデルが直接指定された
         if isinstance(config_path, HyperParameters):
@@ -124,12 +115,9 @@ class TTSModel:
             )
         self.style_vector_inference: Optional[Any] = None
 
-        # net_g / null_model_params は PyTorch 推論時のみ遅延初期化される
-        self.net_g: Union[SynthesizerTrn, SynthesizerTrnJPExtra, None] = None
+        # net_g / null_model_params は遅延初期化される
+        self.net_g: Optional[SynthesizerTrn] = None
         self.null_model_params: Optional[dict[int, NullModelParam]] = None
-
-        # onnx_session は ONNX 推論時のみ遅延初期化される
-        self.onnx_session: Optional[onnxruntime.InferenceSession] = None
 
     def load(self) -> None:
         """
@@ -138,97 +126,66 @@ class TTSModel:
 
         start_time = time.time()
 
-        # PyTorch 推論時
-        if not self.is_onnx_model:
-            from style_bert_vits2.models.infer import get_net_g
+        import torch
 
-            # PyTorch モデルをロード
-            self.net_g = get_net_g(
-                model_path=str(self.model_path),
+        from style_bert_vits2.models.infer import get_net_g
+
+        # モデルをロード
+        self.net_g = get_net_g(
+            model_path=str(self.model_path),
+            version=self.hyper_parameters.version,
+            device=self.device,
+            hps=self.hyper_parameters,
+            dtype=getattr(torch, self.dtype),
+        )
+        logger.info(
+            f'Model loaded successfully from {self.model_path} to "{self.device}" device ({time.time() - start_time:.2f}s)'
+        )
+
+        # ここからはヌルモデルのロード用パラメータが指定されている場合のみ
+        if self.null_model_params is None:
+            return
+
+        # 推論対象のモデルの重みとヌルモデルの重みをマージ
+        for null_model_info in self.null_model_params.values():
+            logger.info(f"Adding null model: {null_model_info.path}...")
+            null_model_add = get_net_g(
+                model_path=str(null_model_info.path),
                 version=self.hyper_parameters.version,
                 device=self.device,
                 hps=self.hyper_parameters,
+                dtype=getattr(torch, self.dtype),
             )
-            logger.info(
-                f'Model loaded successfully from {self.model_path} to "{self.device}" device ({time.time() - start_time:.2f}s)'
+            # 愚直。もっと上手い方法ありそう
+            params = zip(
+                self.net_g.dec.parameters(), null_model_add.dec.parameters()
             )
-
-            # ここからはヌルモデルのロード用パラメータが指定されている場合のみ
-            if self.null_model_params is None:
-                return
-
-            # 推論対象のモデルの重みとヌルモデルの重みをマージ
-            for null_model_info in self.null_model_params.values():
-                logger.info(f"Adding null model: {null_model_info.path}...")
-                null_model_add = get_net_g(
-                    model_path=str(null_model_info.path),
-                    version=self.hyper_parameters.version,
-                    device=self.device,
-                    hps=self.hyper_parameters,
-                )
-                # 愚直。もっと上手い方法ありそう
-                params = zip(
-                    self.net_g.dec.parameters(), null_model_add.dec.parameters()
-                )
-                for v in params:
-                    v[0].data.add_(v[1].data, alpha=float(null_model_info.weight))
-                params = zip(
-                    self.net_g.flow.parameters(), null_model_add.flow.parameters()
-                )
-                for v in params:
-                    v[0].data.add_(v[1].data, alpha=float(null_model_info.pitch))
-
-                params = zip(
-                    self.net_g.enc_p.parameters(), null_model_add.enc_p.parameters()
-                )
-                for v in params:
-                    v[0].data.add_(v[1].data, alpha=float(null_model_info.style))
-                # テンポは sdp と dp 二つあるからとりあえずどっちも足す
-                params = zip(
-                    self.net_g.sdp.parameters(), null_model_add.sdp.parameters()
-                )
-                for v in params:
-                    v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
-                params = zip(self.net_g.dp.parameters(), null_model_add.dp.parameters())
-                for v in params:
-                    v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
-
-            logger.info(
-                f"Null models merged successfully ({time.time() - start_time:.2f}s)"
+            for v in params:
+                v[0].data.add_(v[1].data, alpha=float(null_model_info.weight))
+            params = zip(
+                self.net_g.flow.parameters(), null_model_add.flow.parameters()
             )
+            for v in params:
+                v[0].data.add_(v[1].data, alpha=float(null_model_info.pitch))
 
-        # ONNX 推論時
-        else:
-            # 推論時に一番優先される ExecutionProvider の名前を取得
-            assert len(self.onnx_providers) > 0
-            first_provider_name = (
-                self.onnx_providers[0]
-                if type(self.onnx_providers[0]) is str
-                else self.onnx_providers[0][0]
+            params = zip(
+                self.net_g.enc_p.parameters(), null_model_add.enc_p.parameters()
             )
+            for v in params:
+                v[0].data.add_(v[1].data, alpha=float(null_model_info.style))
+            # テンポは sdp と dp 二つあるからとりあえずどっちも足す
+            params = zip(
+                self.net_g.sdp.parameters(), null_model_add.sdp.parameters()
+            )
+            for v in params:
+                v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
+            params = zip(self.net_g.dp.parameters(), null_model_add.dp.parameters())
+            for v in params:
+                v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
 
-            # 推論セッションの設定
-            sess_options = onnxruntime.SessionOptions()
-            ## ONNX モデルの作成時にすでに onnxsim により最適化されていることから、ロード高速化のため最適化を無効にする
-            ## DmlExecutionProvider が先頭に指定されているときのみ、DirectML 推論の高速化のためすべての最適化を有効にする
-            if first_provider_name == "DmlExecutionProvider":
-                sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL  # fmt: skip
-            else:
-                sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL  # fmt: skip
-            ## エラー以外のログを出力しない
-            ## 本来は log_severity_level = 3 だけで効くはずだが、なぜか CUDA 系のログが抑制できないので set_default_logger_severity() も呼び出している
-            sess_options.log_severity_level = 3
-            onnxruntime.set_default_logger_severity(3)
-
-            # ONNX モデルをロードし、推論セッションを初期化
-            self.onnx_session = onnxruntime.InferenceSession(
-                str(self.model_path),
-                sess_options=sess_options,
-                providers=self.onnx_providers,
-            )
-            logger.info(
-                f"Model loaded successfully from {self.model_path} to {self.onnx_session.get_providers()[0]} ({time.time() - start_time:.2f}s)"
-            )
+        logger.info(
+            f"Null models merged successfully ({time.time() - start_time:.2f}s)"
+        )
 
     def unload(self) -> None:
         """
@@ -238,7 +195,6 @@ class TTSModel:
 
         start_time = time.time()
 
-        # PyTorch 推論時
         if self.net_g is not None:
             import torch
 
@@ -248,11 +204,6 @@ class TTSModel:
             # CUDA キャッシュをクリア
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        # ONNX 推論時
-        if self.onnx_session is not None:
-            del self.onnx_session
-            self.onnx_session = None
 
         gc.collect()
         logger.info(f"Model unloaded successfully ({time.time() - start_time:.2f}s)")
@@ -281,7 +232,7 @@ class TTSModel:
 
         Args:
             audio_path (str): 音声ファイルのパス
-            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0.
+            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0
         Returns:
             NDArray[Any]: スタイルベクトル
         """
@@ -357,7 +308,6 @@ class TTSModel:
     def infer(
         self,
         text: str,
-        language: Languages = Languages.JP,
         speaker_id: int = 0,
         reference_audio_path: Optional[str] = None,
         sdp_ratio: float = DEFAULT_SDP_RATIO,
@@ -383,7 +333,6 @@ class TTSModel:
 
         Args:
             text (str): 読み上げるテキスト
-            language (Languages, optional): 言語. Defaults to Languages.JP.
             speaker_id (int, optional): 話者 ID. Defaults to 0.
             reference_audio_path (Optional[str], optional): 音声スタイルの参照元の音声ファイルのパス. Defaults to None.
             sdp_ratio (float, optional): DP と SDP の混合比。0 で DP のみ、1で SDP のみを使用 (値を大きくするとテンポに緩急がつく). Defaults to DEFAULT_SDP_RATIO.
@@ -401,17 +350,13 @@ class TTSModel:
             given_tone (Optional[list[int]], optional): アクセントのトーンのリスト. Defaults to None.
             pitch_scale (float, optional): ピッチの高さ (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
             intonation_scale (float, optional): 抑揚の平均からの変化幅 (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
-            null_model_params (Optional[dict[int, NullModelParam]], optional): 推論時に使用するヌルモデルの情報。ONNX 推論では無視される。
+            null_model_params (Optional[dict[int, NullModelParam]], optional): 推論時に使用するヌルモデルの情報。
             force_reload_model (bool, optional): モデルを強制的に再ロードするかどうか. Defaults to False.
         Returns:
             tuple[int, NDArray[Any]]: サンプリングレートと音声データ (16bit PCM)
         """
 
         logger.info(f"Start generating audio data from text:\n{text}")
-        if language != "JP" and self.hyper_parameters.version.endswith("JP-Extra"):
-            raise ValueError(
-                "The model is trained with JP-Extra, but the language is not JP"
-            )
         if reference_audio_path == "":
             reference_audio_path = None
         if assist_text == "" or not use_assist_text:
@@ -426,101 +371,39 @@ class TTSModel:
                 reference_audio_path, style_weight
             )
 
-        # PyTorch 推論時
+        import torch
+
+        from style_bert_vits2.models.infer import infer
+
         start_time = time.time()
-        if not self.is_onnx_model:
-            import torch
 
-            from style_bert_vits2.models.infer import infer
-
-            if null_model_params is not None:
-                self.null_model_params = null_model_params
-            else:
-                self.null_model_params = None
-
-            # force_reload_model が True のとき、メモリ上に保持されているモデルを破棄する
-            if force_reload_model is True:
-                self.net_g = None
-
-            # モデルがロードされていない場合はロードする
-            if self.net_g is None:
-                self.load()
-            assert self.net_g is not None
-
-            # 通常のテキストから音声を生成
-            if not line_split:
-                with torch.no_grad():
-                    audio = infer(
-                        text=text,
-                        sdp_ratio=sdp_ratio,
-                        noise_scale=noise,
-                        noise_scale_w=noise_w,
-                        length_scale=length,
-                        sid=speaker_id,
-                        language=language,
-                        hps=self.hyper_parameters,
-                        net_g=self.net_g,
-                        device=self.device,
-                        assist_text=assist_text,
-                        assist_text_weight=assist_text_weight,
-                        style_vec=style_vector,
-                        given_phone=given_phone,
-                        given_tone=given_tone,
-                    )
-
-            # 改行ごとに分割して音声を生成
-            else:
-                texts = [t for t in text.split("\n") if t != ""]
-                audios = []
-                with torch.no_grad():
-                    for i, t in enumerate(texts):
-                        audios.append(
-                            infer(
-                                text=t,
-                                sdp_ratio=sdp_ratio,
-                                noise_scale=noise,
-                                noise_scale_w=noise_w,
-                                length_scale=length,
-                                sid=speaker_id,
-                                language=language,
-                                hps=self.hyper_parameters,
-                                net_g=self.net_g,
-                                device=self.device,
-                                assist_text=assist_text,
-                                assist_text_weight=assist_text_weight,
-                                style_vec=style_vector,
-                            )
-                        )
-                        if i != len(texts) - 1:
-                            audios.append(np.zeros(int(44100 * split_interval)))
-                    audio = np.concatenate(audios)
-
-        # ONNX 推論時
+        if null_model_params is not None:
+            self.null_model_params = null_model_params
         else:
-            from style_bert_vits2.models.infer_onnx import infer_onnx
+            self.null_model_params = None
 
-            # force_reload_model が True のとき、メモリ上に保持されているモデルを破棄する
-            if force_reload_model is True:
-                self.onnx_session = None
+        # force_reload_model が True のとき、メモリ上に保持されているモデルを破棄する
+        if force_reload_model is True:
+            self.net_g = None
 
-            # モデルがロードされていない場合はロードする
-            if self.onnx_session is None:
-                self.load()
-            assert self.onnx_session is not None
+        # モデルがロードされていない場合はロードする
+        if self.net_g is None:
+            self.load()
+        assert self.net_g is not None
 
-            # 通常のテキストから音声を生成
-            if not line_split:
-                audio = infer_onnx(
+        # 通常のテキストから音声を生成
+        if not line_split:
+            with torch.no_grad():
+                audio = infer(
                     text=text,
                     sdp_ratio=sdp_ratio,
                     noise_scale=noise,
                     noise_scale_w=noise_w,
                     length_scale=length,
                     sid=speaker_id,
-                    language=language,
                     hps=self.hyper_parameters,
-                    onnx_session=self.onnx_session,
-                    onnx_providers=self.onnx_providers,
+                    net_g=self.net_g,
+                    device=self.device,
                     assist_text=assist_text,
                     assist_text_weight=assist_text_weight,
                     style_vec=style_vector,
@@ -528,23 +411,23 @@ class TTSModel:
                     given_tone=given_tone,
                 )
 
-            # 改行ごとに分割して音声を生成
-            else:
-                texts = [t for t in text.split("\n") if t != ""]
-                audios = []
+        # 改行ごとに分割して音声を生成
+        else:
+            texts = [t for t in text.split("\n") if t != ""]
+            audios = []
+            with torch.no_grad():
                 for i, t in enumerate(texts):
                     audios.append(
-                        infer_onnx(
+                        infer(
                             text=t,
                             sdp_ratio=sdp_ratio,
                             noise_scale=noise,
                             noise_scale_w=noise_w,
                             length_scale=length,
                             sid=speaker_id,
-                            language=language,
                             hps=self.hyper_parameters,
-                            onnx_session=self.onnx_session,
-                            onnx_providers=self.onnx_providers,
+                            net_g=self.net_g,
+                            device=self.device,
                             assist_text=assist_text,
                             assist_text_weight=assist_text_weight,
                             style_vec=style_vector,
@@ -586,12 +469,11 @@ class TTSModelHolder:
         self,
         model_root_dir: Path,
         device: str,
-        onnx_providers: Sequence[Union[str, tuple[str, dict[str, Any]]]],
-        ignore_onnx: bool = False,
+        dtype: str = "float16",
     ) -> None:
         """
         Style-Bert-VITS2 の音声合成モデルを管理するクラスを初期化する。
-        音声合成モデルは下記のように配置されていることを前提とする (.safetensors / .onnx のファイル名は自由) 。
+        音声合成モデルは下記のように配置されていることを前提とする (.safetensors のファイル名は自由) 。
         ```
         model_root_dir
         ├── model-name-1
@@ -607,15 +489,13 @@ class TTSModelHolder:
 
         Args:
             model_root_dir (Path): 音声合成モデルが配置されているディレクトリのパス
-            device (str): PyTorch 推論での音声合成時に利用するデバイス (cpu, cuda, mps など)
-            onnx_providers (list[str]): ONNX 推論で利用する ExecutionProvider (CPUExecutionProvider, CUDAExecutionProvider など)
-            ignore_onnx (bool, optional): ONNX モデルを除外するかどうか. Defaults to False.
+            device (str): 音声合成時に利用するデバイス (cpu, cuda, mps など)
+            dtype (str): 音声合成時に利用する重みの精度 ("float32" / "float16")
         """
 
         self.root_dir: Path = model_root_dir
         self.device: str = device
-        self.onnx_providers: Sequence[Union[str, tuple[str, dict[str, Any]]]] = onnx_providers  # fmt: skip
-        self.ignore_onnx: bool = ignore_onnx
+        self.dtype: str = dtype
         self.model_files_dict: dict[str, list[Path]] = {}
         self.current_model: Optional[TTSModel] = None
         self.model_names: list[str] = []
@@ -637,8 +517,6 @@ class TTSModelHolder:
             if model_dir.name.startswith("."):
                 continue
             suffixes = [".pth", ".pt", ".safetensors"]
-            if self.ignore_onnx is False:
-                suffixes.append(".onnx")
             model_files = sorted(
                 [
                     f
@@ -699,14 +577,19 @@ class TTSModelHolder:
                 config_path=self.root_dir / model_name / "config.json",
                 style_vec_path=self.root_dir / model_name / "style_vectors.npy",
                 device=self.device,
-                onnx_providers=self.onnx_providers,
+                dtype=self.dtype,
             )
 
         return self.current_model
 
-    def get_model_for_gradio(self, model_name: str, model_path_str: str):
+    def get_model_for_gradio(
+        self, model_name: str, model_path_str: str, dtype: Optional[str] = None
+    ):
+        """GUI からモデルを取得する。dtype を指定した場合（float32/float16）はロード時に適用される。"""
         import gradio as gr
 
+        if dtype is not None:
+            self.dtype = dtype
         model_path = Path(model_path_str)
         if model_name not in self.model_files_dict:
             raise ValueError(f"Model `{model_name}` is not found")
@@ -715,6 +598,7 @@ class TTSModelHolder:
         if (
             self.current_model is not None
             and self.current_model.model_path == model_path
+            and self.current_model.dtype == self.dtype
         ):
             # Already loaded
             speakers = list(self.current_model.spk2id.keys())
@@ -729,7 +613,7 @@ class TTSModelHolder:
             config_path=self.root_dir / model_name / "config.json",
             style_vec_path=self.root_dir / model_name / "style_vectors.npy",
             device=self.device,
-            onnx_providers=self.onnx_providers,
+            dtype=self.dtype,
         )
         speakers = list(self.current_model.spk2id.keys())
         styles = list(self.current_model.style2id.keys())

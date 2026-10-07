@@ -291,6 +291,13 @@ class MultiHeadAttention(nn.Module):
         value: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # フルFP16推論対応：アテンションスコアの絶対値は半精度の最大値を超えうるため、内部計算のみ float32 に提升し、結果は元の dtype で返す
+        out_dtype = query.dtype
+        if out_dtype == torch.float16:
+            query = query.float()
+            key = key.float()
+            value = value.float()
+
         # reshape [b, d, t] -> [b, n_h, t, d_k]
         b, d, t_s, t_t = (*key.size(), query.size(2))
         query = query.view(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)
@@ -302,7 +309,9 @@ class MultiHeadAttention(nn.Module):
             assert (
                 t_s == t_t
             ), "Relative attention is only available for self-attention."
-            key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
+            key_relative_embeddings = self._get_relative_embeddings(
+                self.emb_rel_k, t_s
+            ).to(query.dtype)
             rel_logits = self._matmul_with_relative_keys(
                 query / math.sqrt(self.k_channels), key_relative_embeddings
             )
@@ -332,14 +341,14 @@ class MultiHeadAttention(nn.Module):
             relative_weights = self._absolute_position_to_relative_position(p_attn)
             value_relative_embeddings = self._get_relative_embeddings(
                 self.emb_rel_v, t_s
-            )
+            ).to(query.dtype)
             output = output + self._matmul_with_relative_values(
                 relative_weights, value_relative_embeddings
             )
         output = (
             output.transpose(2, 3).contiguous().view(b, d, t_t)
         )  # [b, n_h, t_t, d_k] -> [b, d, t_t]
-        return output, p_attn
+        return output.to(out_dtype), p_attn
 
     def _matmul_with_relative_values(
         self, x: torch.Tensor, y: torch.Tensor

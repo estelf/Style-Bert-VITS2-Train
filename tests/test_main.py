@@ -1,142 +1,186 @@
-from collections.abc import Sequence
-from typing import Any, Literal
+"""コア学習フロー（前処理 → 学習 → 合成）とコアライブラリ推論の回帰テスト。
 
+テストデータは tests/data/<モデル名>/（esd.list + raw.zip の完成済みデータセット契約の例）に置く。
+・データセット・ゴールデンデータは git に含まれないので、開発時に各自で用意する（git clone 直後は存在しないのが正常）
+・差し替え: データセットを tests/data/ に置いて SBV2_TEST_MODEL を変えるだけでよい（DATASET_ROOT は自動で tests/data に向く）
+・ゴールデンデータについて: 学習は意図的に1エポック（シード固定）しか行わないため重みはノイズ混じりだが、
+  その出力こそがゴールデン（tests/references/）である。目的は品質検証ではなく、transformers 等のバージョン変更で
+  BERT 出力＝推論結果が破壊的に変わったことを相関差分検知するためのもので、「1エポックのノイズ音声」でも契約として一致を見る必要がある。
+・ついでにコアライブラリのフルFP16推論（重みごと半精度でキャストして推論）のスモークテストも行う。
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
 import pytest
+import torch
 from scipy.io import wavfile
 
-from style_bert_vits2.constants import BASE_DIR, Languages
-from style_bert_vits2.logging import logger
-from style_bert_vits2.tts_model import TTSModelHolder
+# style_bert_vits2 / preprocess を import する前にデータセットルート差し替えを示す（サブプロセスにも継承される）
+TEST_DATA_ROOT = Path(__file__).parent / "data"
+os.environ["SBV2_DATASET_ROOT"] = str(TEST_DATA_ROOT)
+
+import preprocess as preprocess_pkg  # noqa: E402
+from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT  # noqa: E402
+from style_bert_vits2.logging import logger  # noqa: E402
+from style_bert_vits2.tts_model import TTSModel  # noqa: E402
+
+# 入れ替え可能なテストデータセット名（tests/data/<モデル名> を使う）
+MODEL_NAME = os.environ.get(
+    "SBV2_TEST_MODEL", "model_1"
+)  # デフォルトは model_1（tests/data/model_1/ に esd.list + raw.zip がある想定）
+DATASET_PATH = DATASET_ROOT / MODEL_NAME
+# 学習で保存され、推論に使うディレクトリ（config.json / style_vectors.npy / .safetensors）
+MODELS_PATH = ASSETS_ROOT / MODEL_NAME
+REFERENCE_DIR = Path(__file__).parent / "references"
+
+# 固定テキスト・固定スタイル（参照音声生成時と必ず一致させること）
+TEST_TEXT = "こんにちは、初めまして。あなたの名前はなんていうの？"
+TEST_STYLE = "Neutral"
 
 
-def synthesize(
-    inference_type: Literal["torch", "onnx"] = "torch",
-    device: str = "cpu",
-    onnx_providers: Sequence[tuple[str, dict[str, Any]]] = [
-        ("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}),
-    ],
-):
+def _prepare_dataset():
+    """テストデータセットを学習可能な状態に前処理する（環境構築ダウンロード → Step 1〜6）。
 
-    # 音声合成モデルが配置されていれば、音声合成を実行
-    model_holder = TTSModelHolder(BASE_DIR / "model_assets", device, onnx_providers)
-    if len(model_holder.models_info) > 0:
-
-        # "koharune-ami" または "amitaro" モデルを探す
-        for model_info in model_holder.models_info:
-            if model_info.name == "koharune-ami" or model_info.name == "amitaro":
-
-                # Safetensors 形式または ONNX 形式のモデルファイルに絞り込む
-                if inference_type == "torch":
-                    model_files = [
-                        f
-                        for f in model_info.files
-                        if f.endswith(".safetensors") and not f.startswith(".")
-                    ]
-                else:
-                    model_files = [
-                        f
-                        for f in model_info.files
-                        if f.endswith(".onnx") and not f.startswith(".")
-                    ]
-                if len(model_files) == 0:
-                    pytest.skip(
-                        f'音声合成モデル "{model_info.name}" のモデルファイルが見つかりませんでした。'
-                    )
-
-                # モデルをロード
-                model = model_holder.get_model(model_info.name, model_files[0])
-                model.load()
-
-                # ロードされた InferenceSession の ExecutionProvider が一致するか確認
-                # 一致しない場合、指定された ExecutionProvider で推論できない状態
-                if inference_type == "onnx":
-                    assert model.onnx_session is not None
-                    assert model.onnx_session.get_providers()[0] == onnx_providers[0][0]
-
-                # すべてのスタイルに対して音声合成を実行
-                for style in model_info.styles:
-                    logger.info(f"Testing style: {style}")
-
-                    # テストに使用するサンプルテキスト
-                    sample_texts = [
-                        "こんにちは、初めまして。あなたの名前はなんていうの？",
-                        "桜の樹の下には屍体が埋まっている！これは信じていいことなんだよ。",
-                        "あなたがいなくなって、私は一人になっちゃって、泣いちゃいそうなほど悲しい。",
-                        "音声合成は、機械学習を活用して、テキストから人の声を再現する技術です。この技術は、言語の構造を解析し、それに基づいて音声を生成します。",
-                    ]
-
-                    # 各サンプルテキストに対して音声合成を実行
-                    for i, text in enumerate(sample_texts):
-
-                        # 音声合成を実行
-                        sample_rate, audio_data = model.infer(
-                            text,
-                            # 言語 (JP, EN, ZH / JP-Extra モデルの場合は JP のみ)
-                            language=Languages.JP,
-                            # 話者 ID (音声合成モデルに複数の話者が含まれる場合のみ必須、単一話者のみの場合は 0)
-                            speaker_id=0,
-                            # テンポの緩急 (0.0 〜 1.0)
-                            sdp_ratio=0.4,
-                            # スタイル (Neutral, Happy など)
-                            style=style,
-                            # スタイルの強さ (0.0 〜 100.0)
-                            style_weight=2.0,
-                        )
-
-                        # 音声データを保存
-                        (BASE_DIR / f"tests/wavs/{model_info.name}").mkdir(exist_ok=True, parents=True)  # fmt: skip
-                        wav_file_path = BASE_DIR / f"tests/wavs/{model_info.name}/{style}_{i+1:02d}.wav"  # fmt: skip
-                        with open(wav_file_path, "wb") as f:
-                            wavfile.write(f, sample_rate, audio_data)
-
-                        # 音声データが保存されたことを確認
-                        assert wav_file_path.exists()
-
-                # モデルをアンロード
-                model.unload()
-    else:
-        pytest.skip("音声合成モデルが見つかりませんでした。")
-
-
-def test_synthesize_cpu():
-    synthesize(inference_type="torch", device="cpu")
-
-
-def test_synthesize_cuda():
-    synthesize(inference_type="torch", device="cuda")
-
-
-def test_synthesize_onnx_cpu():
-    synthesize(
-        inference_type="onnx",
-        onnx_providers=[
-            ("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}),
-        ],
+    毎回必ず全ステップを実行する（冪等な処理ばかりで、BERT特徴・スタイル特徴は既存ファイルがあれば再利用され速い）。
+    特に Step 1 の initialize が models/ を事前学習モデル（G_0.safetensors）でリセットするため、
+    学習は常に同じ初期状態の1エポックになり、ゴールデン音声との比較が決定論的に保たれる。
+    """
+    if not DATASET_PATH.exists():
+        pytest.skip(
+            f"テストデータセット {DATASET_PATH} がありません。"
+            "データセットは git に含まれないため、各自で tests/data/<モデル名>/ に配置してください"
+            f"（現在のデフォルト: SBV2_TEST_MODEL={MODEL_NAME}）。"
+        )
+    # エポック数は最小にして、数ステップの学習で済ませる（回帰テストなので品質は問わない）
+    preprocess_pkg.preprocess_all(
+        model_name=MODEL_NAME,
+        batch_size=2,
+        epochs=1,
+        save_every_steps=1000,
+        num_processes=2,
+        freeze_JP_bert=False,
+        freeze_style=False,
+        freeze_decoder=False,
+        log_interval=1000,
+        val_per_lang=0,
+        yomi_error="raise",
     )
 
 
-def test_synthesize_onnx_cuda():
-    synthesize(
-        inference_type="onnx",
-        onnx_providers=[
-            ("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested", "cudnn_conv_algo_search": "DEFAULT"}),  # fmt: skip
-        ],
+def _train_short():
+    """学習を1エポックだけ実行し、モデルを model_assets/ に保存する（決定論的: seed は config の 42 固定）"""
+    g_files = sorted(MODELS_PATH.glob("*.safetensors"))
+    if len(g_files) > 0:
+        logger.info("Trained model already exists. Skip training.")
+        return g_files[0]
+    subprocess.run(
+        [sys.executable, "-m", "train.pipeline", "--model_name", MODEL_NAME],
+        check=True,
+    )
+    g_files = sorted(MODELS_PATH.glob("*.safetensors"))
+    assert len(g_files) > 0, "学習済みモデルが見つかりません"
+    return g_files[0]
+
+
+def synthesize_and_compare():
+    """固定テキスト＋固定スタイルで合成し、ゴールデン音声（1エポック学習ノイズモデルの決定論的出力）と差分比較する"""
+    model_file = _train_short()
+
+    # 学習済みモデル（.safetensors）+ style_vectors.npy + config.json の構成でロード
+    model = TTSModel(
+        model_path=model_file,
+        config_path=MODELS_PATH / "config.json",
+        style_vec_path=MODELS_PATH / "style_vectors.npy",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    model.load()
+
+    # 決定論性を担保するため合成直前にシードを固定
+    torch.manual_seed(42)
+    sample_rate, audio = model.infer(
+        text=TEST_TEXT,
+        speaker_id=0,
+        style=TEST_STYLE,
+        style_weight=1.0,
+        line_split=False,
+    )
+    model.unload()
+
+    reference_path = REFERENCE_DIR / MODEL_NAME / f"{TEST_STYLE}.wav"
+    if not reference_path.exists():
+        # 初回は参照音声を作成してスキップ（以降の実行で差分を検知する）
+        reference_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(reference_path, "wb") as f:
+            wavfile.write(f, sample_rate, audio)
+        pytest.skip(f"参照音声を作成しました: {reference_path}")
+
+    ref_sr, ref_audio = wavfile.read(reference_path)
+    assert ref_sr == sample_rate, "サンプリングレートが参照音声と一致しません"
+    assert len(ref_audio) == len(
+        audio
+    ), f"音声長が参照音声と一致しません: {len(audio)} != {len(ref_audio)}"
+
+    # 相関による差分閾値テスト（完全一致ではなく破壊的変更の検知が目的）
+    a = audio.astype(np.float64) / np.abs(audio).max()
+    b = ref_audio.astype(np.float64) / np.abs(ref_audio).max()
+    corr = float(np.corrcoef(a, b)[0, 1])
+    logger.info(f"Regression correlation with reference: {corr:.6f}")
+    assert corr > 0.98, (
+        f"合成音声が参照音声と大きく乖離しています (corr={corr:.4f})。"
+        "ライブラリバージョン変更に伴う破壊的変更の可能性があります。"
     )
 
 
-def test_synthesize_onnx_directml():
-    synthesize(
-        inference_type="onnx",
-        onnx_providers=[
-            ("DmlExecutionProvider", {"device_id": 0}),
-        ],
-    )
+def test_pipeline_and_synthesize_cpu():
+    """CPU でも動くスモークテスト（前処理 → 学習 → 合成 → ゴールデン音声との差分比較）"""
+    _prepare_dataset()
+    synthesize_and_compare()
 
 
-def test_synthesize_onnx_coreml():
-    synthesize(
-        inference_type="onnx",
-        onnx_providers=[
-            ("CoreMLExecutionProvider", {}),
-        ],
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_pipeline_and_synthesize_cuda():
+    """GPU を使った本番構成での回帰テスト"""
+    _prepare_dataset()
+    synthesize_and_compare()
+
+
+def test_infer_full_half_precision():
+    """コアライブラリのフルFP16推論スモークテスト（重みごと半精度にキャストして合成できること）
+    ※bfloat16 は仮数が8ビットしかなく duration の ceil() 量子化と組み合わせて精度劣化が大きいため廃止済み"""
+    model_file = _train_short()
+    with pytest.raises(ValueError):
+        TTSModel(
+            model_path=model_file,
+            config_path=MODELS_PATH / "config.json",
+            style_vec_path=MODELS_PATH / "style_vectors.npy",
+            dtype="bfloat16",
+        )
+    model = TTSModel(
+        model_path=model_file,
+        config_path=MODELS_PATH / "config.json",
+        style_vec_path=MODELS_PATH / "style_vectors.npy",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        dtype="float16",
     )
+    model.load()
+    # 重みがフル半精度でロードされていることを確認
+    assert model.net_g is not None
+    assert next(model.net_g.parameters()).dtype == torch.float16
+
+    torch.manual_seed(42)
+    sample_rate, audio = model.infer(
+        text=TEST_TEXT,
+        speaker_id=0,
+        style=TEST_STYLE,
+        style_weight=1.0,
+        line_split=False,
+    )
+    model.unload()
+
+    assert sample_rate == 44100
+    assert len(audio) > 0 and np.all(np.isfinite(audio))
+    assert np.abs(audio.astype(np.float64)).max() > 0, "音が出力されていない"

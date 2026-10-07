@@ -1,14 +1,11 @@
 import subprocess
 import sys
-from typing import Any, Callable
 
 from style_bert_vits2.logging import logger
 from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
 
 
-def run_script_with_log(
-    cmd: list[str], ignore_warning: bool = False
-) -> tuple[bool, str]:
+def run_script_with_log(cmd: list[str], ignore_warning: bool = False) -> tuple[bool, str]:
     """
     指定されたコマンドを実行し、そのログを記録する。
 
@@ -38,22 +35,3 @@ def run_script_with_log(
     logger.success(f"Success: {' '.join(cmd)}")
 
     return True, ""
-
-
-def second_elem_of(
-    original_function: Callable[..., tuple[Any, Any]],
-) -> Callable[..., Any]:
-    """
-    与えられた関数をラップし、その戻り値の 2 番目の要素のみを返す関数を生成する。
-
-    Args:
-        original_function (Callable[..., tuple[Any, Any]])): ラップする元の関数
-
-    Returns:
-        Callable[..., Any]: 元の関数の戻り値の 2 番目の要素のみを返す関数
-    """
-
-    def inner_function(*args, **kwargs) -> Any:  # type: ignore
-        return original_function(*args, **kwargs)[1]
-
-    return inner_function

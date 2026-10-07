@@ -6,11 +6,13 @@
     "seed": 42,
     "epochs": 1000,
     "learning_rate": 0.0001,
-    "betas": [0.8, 0.99],
-    "eps": 1e-9,
+    "betas": [
+      0.8,
+      0.99
+    ],
+    "eps": 1e-09,
     "batch_size": 2,
-    "bf16_run": false,
-    "fp16_run": false,
+    "dtype": "bfloat16",
     "lr_decay": 0.99996,
     "segment_size": 16384,
     "init_lr_ratio": 1,
@@ -19,15 +21,12 @@
     "c_kl": 1.0,
     "c_commit": 100,
     "skip_optimizer": false,
-    "freeze_ZH_bert": false,
     "freeze_JP_bert": false,
-    "freeze_EN_bert": false,
     "freeze_emo": false,
     "freeze_style": false,
     "freeze_decoder": false
   },
   "data": {
-    "use_jp_extra": true,
     "training_files": "Data/Dummy/train.list",
     "validation_files": "Data/Dummy/val.list",
     "max_wav_value": 32768.0,
@@ -56,20 +55,48 @@
     "kernel_size": 3,
     "p_dropout": 0.1,
     "resblock": "1",
-    "resblock_kernel_sizes": [3, 7, 11],
-    "resblock_dilation_sizes": [
-      [1, 3, 5],
-      [1, 3, 5],
-      [1, 3, 5]
+    "resblock_kernel_sizes": [
+      3,
+      7,
+      11
     ],
-    "upsample_rates": [8, 8, 2, 2, 2],
+    "resblock_dilation_sizes": [
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ]
+    ],
+    "upsample_rates": [
+      8,
+      8,
+      2,
+      2,
+      2
+    ],
     "upsample_initial_channel": 512,
-    "upsample_kernel_sizes": [16, 16, 8, 2, 2],
+    "upsample_kernel_sizes": [
+      16,
+      16,
+      8,
+      2,
+      2
+    ],
     "n_layers_q": 3,
     "use_spectral_norm": false,
     "gin_channels": 512,
     "slm": {
-      "model": "./slm/wavlm-base-plus",
+      "model": "./pretrained/slm/wavlm-base-plus",
       "sr": 16000,
       "hidden": 768,
       "nlayers": 13,
