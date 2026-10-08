@@ -25,7 +25,7 @@ uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl
 ```
 Data/<モデル名>/
   ├─ esd.list    # 1行1文: <音声ファイル名>|<話者名>|JP|<セリフ文字列>
-  └─ raw.zip     # 解凍済み音声（.flac / .wav）。スタイルごとにフォルダ分けするとそのままスタイルになる
+  └─ raw.zip     # 解凍済み音声（.flac / .wav）。Neutral 1本で使うので基本はフォルダ分け不要
 ```
 
 - **検証**: 前処理の Step 3（`preprocess/check_dataset.py`）が、全音声のサンプリングレート（44100Hz）とモノラルを自動的にチェックし、不正なファイルがあれば名前付きで即失敗します
@@ -70,22 +70,24 @@ uv run train_model.py -m <モデル名>
 | `-b, --batch_size` | 2 | バッチサイズ（VRAMが足りないなら下げる） |
 | `-e, --epochs` | 100 | エポック数 |
 | `-s, --save_every_steps` | 1000 | このステップごとに保存・学習終了 |
-| `--val_per_lang` | 0 | 話者ごとの検証データ数 |
+| `--val_per_lang` | 4 | 話者ごとの検証データ数（0 で無効化。検証発話は TensorBoard の eval/ に生成音声・正解音声がログされる） |
 | `--yomi_error` | raise | 読み上げエラーの扱い（raise / skip / use） |
 
 学習の再開は、同じモデル名で `uv run train_model.py -m <モデル名>` を実行するだけです。スタイル生成は `model_assets/<モデル名>/` に推論資産（config.json + style_vectors.npy）が既にあれば自動でスキップされるため、コマンドラインでの指定は不要です。
+
+スタイルは **Neutral 1本のみが既定**です（Neutral だけでも十分高い精度が出るため）。サブディレクトリごとにスタイルを分けたい場合だけ `uv run train_model.py -m <モデル名> --styles_by_dirs` を明示してください（フォルダ分けしていてもこのフラグが無ければ Neutral として扱われます）。
 
 ## 3. 成果物はどこに生成されるか
 
 ```
 Data/<モデル名>/models/            ← 学習の途中状態・ログ
-  ├─ G_*.pth / D_*.pth / WD_*.pth    チェックポイント（オプティマイザ状態込み、再開用）
+  ├─ G_*.pth / D_*.pth / WD_*.pth / DUR_*.pth    チェックポイント（オプティマイザ状態込み、再開用）
   └─ events.out.tfevents.*           TensorBoard の学習曲線（`uv run -m tensorboard --logdir Data/<モデル名>/models` で閲覧）
 
 model_assets/<モデル名>/           ← 推論・共有用の成果物（この3点セット）
   ├─ config.json                       そのモデルの設定（設計図）
   ├─ <モデル名>_e<epoch>_s<step>.safetensors  学習済み重み
-  └─ style_vectors.npy                 スタイルベクトル（Neutral 等）
+  └─ style_vectors.npy                 スタイルベクトル（既定は Neutral 1本のみ。--styles_by_dirs 時はフォルダ分けの各スタイル分も）
 ```
 
 **モデルを共有するときは `model_assets/<モデル名>/` の3点を丸ごと渡してください。** 名前が統一されていない場合は `style_vectors.npy` と config.json も同じセットのものを使う必要があります。

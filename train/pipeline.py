@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from huggingface_hub import HfApi
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -51,7 +51,6 @@ torch.backends.cudnn.allow_tf32 = (
 )
 torch.set_num_threads(1)
 torch.set_float32_matmul_precision("medium")
-torch.backends.cuda.sdp_kernel("flash")
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(
     True
@@ -98,6 +97,11 @@ def run():
         choices=["float32", "bfloat16"],
         default=None,
         help="学習時の計算精度。未指定なら config.json の train.dtype（既定 float32）を使う。fp16 は動的範囲不足で学習不可のため選択不可",
+    )
+    parser.add_argument(
+        "--styles_by_dirs",
+        action="store_true",
+        help="オプション: wavs/ のサブディレクトリごとにスタイルベクトルを生成する（既定は Neutral 1本のみ。フォルダ分けしていても使われない）。Neutral でも十分高い精度が出るため通常は不要",
     )
     args = parser.parse_args()
 
@@ -184,11 +188,14 @@ def run():
             f"Style assets already exist in {out_dir}, so style generation is skipped automatically (resuming)."
         )
     else:
-        default_style.save_styles_by_dirs(
+        # 既定は Neutral 1本のみ（train.list / val.list の発話が算出対象）。サブディレクトリごとのスタイル生成は --styles_by_dirs のときだけ
+        default_style.save_style_vectors(
+            [hps.data.training_files, hps.data.validation_files],
             os.path.join(dataset_path, "wavs"),
             out_dir,
             config_path=config_path,
             config_output_path=os.path.join(out_dir, "config.json"),
+            styles_by_dirs=args.styles_by_dirs,
         )
 
     torch.manual_seed(hps.train.seed)
@@ -538,7 +545,9 @@ def run():
     else:
         scheduler_wd = None
         wl = None
-    scaler = GradScaler(enabled=False)  # fp16学習は非対応のため常に無効（スルーパスとして動作）
+    scaler = GradScaler(
+        "cuda", enabled=False
+    )  # fp16学習は非対応のため常に無効（スルーパスとして動作）
     logger.info("Start training.")
 
     diff = abs(
@@ -732,7 +741,7 @@ def train_and_evaluate(
         bert = bert.cuda(local_rank, non_blocking=True)
         style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
-        with autocast(enabled=amp_enabled, dtype=torch.bfloat16):
+        with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
             (
                 y_hat,
                 l_length,
@@ -782,7 +791,7 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast(enabled=amp_enabled, dtype=torch.bfloat16):
+            with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
@@ -795,7 +804,7 @@ def train_and_evaluate(
                     logw.detach(),
                     g.detach(),
                 )
-                with autocast(enabled=amp_enabled, dtype=torch.bfloat16):
+                with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
                     # TODO: I think need to mean using the mask, but for now, just mean all
                     (
                         loss_dur_disc,
@@ -816,7 +825,7 @@ def train_and_evaluate(
             if net_wd is not None:
                 # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
                 # shape: (batch, 1, time)
-                with autocast(enabled=amp_enabled, dtype=torch.bfloat16):
+                with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
                     loss_slm = wl.discriminator(
                         y.detach().squeeze(1), y_hat.detach().squeeze(1)
                     ).mean()
@@ -836,7 +845,7 @@ def train_and_evaluate(
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with autocast(enabled=amp_enabled, dtype=torch.bfloat16):
+        with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
             if net_dur_disc is not None:
@@ -844,7 +853,7 @@ def train_and_evaluate(
             if net_wd is not None:
                 loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                 loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast(enabled=amp_enabled, dtype=torch.bfloat16):
+            with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
                 loss_dur = torch.sum(l_length.float())
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl

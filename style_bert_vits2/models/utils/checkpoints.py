@@ -32,7 +32,11 @@ def load_checkpoint(
     """
 
     assert os.path.isfile(checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location=device)
+    # チェックポイントは self-contained な構造（model/optimizer状態のみ）なので明示的に指定する
+    # （torch 2.6+ でデフォルトが True に変更済み。バージョンに依存せず挙動を固定する）
+    checkpoint_dict = torch.load(
+        checkpoint_path, map_location=device, weights_only=True
+    )
     iteration = checkpoint_dict["iteration"]
     learning_rate = checkpoint_dict["learning_rate"]
     logger.info(

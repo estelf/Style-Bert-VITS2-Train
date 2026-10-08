@@ -219,7 +219,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val-per-lang",
         type=int,
-        default=0,
+        default=4,
         help="Number of validation data per SPEAKER, not per language (due to compatibility with the original code).",
     )
     parser.add_argument("--max-val-total", type=int, default=12)
