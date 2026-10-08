@@ -67,7 +67,7 @@
 
 - **`symbols.py` は変更しない**: トークン表・トーンオフセット・`LANGUAGE_ID_MAP` は既存チェックポイントに焼き込まれているため、再学習なしの方針では多言語表のまま残す
 - `librosa` は `data_utils.py` / `mel_processing.py` が使用するためコアに残る
-- `default_style.py`（フォルダ分け→スタイル生成）は `style_gen` 経由の学習後工程なのでコア残留
+- `default_style.py`（スタイル生成）は `style_gen` 経由の学習後工程なのでコア残留。既定は Neutral 1本のみ（それだけでも十分高い精度が出るため）、サブディレクトリごとのスタイル生成は `--styles_by_dirs` のときのみのオプション
 
 ---
 

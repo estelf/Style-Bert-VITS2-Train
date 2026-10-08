@@ -38,6 +38,5 @@ dict_data/          pyopenjtalk ユーザー辞書
 ## ドキュメント
 
 - **[docs/GUIDE.md](/docs/GUIDE.md)** — 実操作ガイド（データセット→学習→成果物→試聴）
-- [docs/FAQ.md](/docs/FAQ.md) — よくある質問
 - [docs/SPLIT_PLAN.md](/docs/SPLIT_PLAN.md) — 本コアの分割設計方針
 - `docs/upstream/` — フォーク元リポジトリのドキュメント（歴史・アーキテクチャ背景としての参照用）

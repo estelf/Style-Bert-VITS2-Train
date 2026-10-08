@@ -40,8 +40,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val_per_lang",
         type=int,
-        help="Validation per speaker",
-        default=0,
+        help="Number of validation data per SPEAKER, not per language (due to compatibility with the original code). 0 で無効化",
+        default=4,
     )
     parser.add_argument(
         "--log_interval",

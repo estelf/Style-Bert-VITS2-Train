@@ -45,17 +45,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# スタイルベクトルの可視化・クラスタリング用 (gradio_tabs/style_vectors.py)
+# 学習ログ用プロット（spectrogram/alignment の画像変換: style_bert_vits2/models/utils/__init__.py）用
 style-vectors = [
     "matplotlib",
-    "scikit-learn",
-    "umap-learn",
 ]
 
 [project.urls]
-Documentation = "https://github.com/litagin02/Style-Bert-VITS2#readme"
-Issues = "https://github.com/litagin02/Style-Bert-VITS2/issues"
-Source = "https://github.com/litagin02/Style-Bert-VITS2"
+Documentation = "https://github.com/estelf/Style-Bert-VITS2#readme"
+Issues = "https://github.com/estelf/Style-Bert-VITS2/issues"
+Source = "https://github.com/estelf/Style-Bert-VITS2"
 
 [tool.uv.build-backend]
 # フラットレイアウトで style_bert_vits2/ をそのままパッケージ化する（デフォルトの src/  layout ではない）

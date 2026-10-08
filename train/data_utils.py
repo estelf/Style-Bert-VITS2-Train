@@ -1,8 +1,9 @@
-import os
 import random
 import sys
+from functools import cache
 
 import numpy as np
+import soundfile as sf
 import torch
 from pathlib import Path
 import torch.utils.data
@@ -16,6 +17,16 @@ from style_bert_vits2.models.utils import load_filepaths_and_text, load_wav_to_t
 from style_bert_vits2.nlp import cleaned_text_to_sequence
 
 """Multi speaker version"""
+
+
+@cache
+def _spec_length(audiopath: str, hop_length: int) -> int:
+    """
+    バケット分け用の音声長（スペクトラムフレーム数）を実測値から求める。
+    ファイルサイズからの推定（16bit PCM WAV前提）と違い FLAC でも正確な実フレーム数ベース。
+    ヘッダのみ読むため高速で、結果はパス単位でキャッシュされる。
+    """
+    return sf.info(audiopath).frames // hop_length
 
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
@@ -63,8 +74,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         Filter text & store spec lengths
         """
         # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
+        # 実フレーム数（WAV/FLAC 問わず soundfile のヘッダから取得）からバケット用長を算出
+        # spec_length = frames // hop_length
 
         audiopaths_sid_text_new = []
         lengths = []
@@ -81,7 +92,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             audiopaths_sid_text_new.append(
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
-            lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+            lengths.append(_spec_length(audiopath, self.hop_length))
             # else:
             #     skipped += 1
         logger.info(
@@ -119,7 +130,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         if self.use_mel_spec_posterior:
             spec_filename = spec_filename.replace(".spec.pt", ".mel.pt")
         try:
-            spec = torch.load(spec_filename)
+            spec = torch.load(spec_filename, weights_only=True)
         except:
             if self.use_mel_spec_posterior:
                 spec = mel_spectrogram_torch(
@@ -158,7 +169,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             word2ph[0] += 1
         bert_path = str(Path(wav_path).with_suffix(".bert.pt"))
         try:
-            ja_bert = torch.load(bert_path)
+            ja_bert = torch.load(bert_path, weights_only=True)
             assert ja_bert.shape[-1] == len(phone)
         except Exception as e:
             logger.warning("Bert load Failed")

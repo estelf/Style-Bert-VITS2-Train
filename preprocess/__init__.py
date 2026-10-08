@@ -109,7 +109,7 @@ def preprocess_all(
     freeze_JP_bert: bool = True,
     freeze_style: bool = False,
     freeze_decoder: bool = False,
-    val_per_lang: int = 0,
+    val_per_lang: int = 4,  # 話者ごとの検証データ数（上流既定の4。0 で無効化）
     log_interval: int = 200,
     yomi_error: str = "raise",
     dtype: str = "float32",

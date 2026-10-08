@@ -1,6 +1,6 @@
 # AGENTS.md
 
-日本語・JP-Extra 一本化の Style-Bert-VITS2 学習コア（フォーク）。詳細は [docs/GUIDE.md](docs/GUIDE.md)、FAQ は docs/FAQ.md、分割設計は docs/SPLIT_PLAN.md を参照。コメント・ドキュメントは日本語で書かれている。
+日本語・JP-Extra 一本化の Style-Bert-VITS2 学習コア（フォーク）。詳細は [docs/GUIDE.md](docs/GUIDE.md)、分割設計は docs/SPLIT_PLAN.md を参照。コメント・ドキュメントは日本語で書かれている。
 
 ## 実行系の基本
 
@@ -26,6 +26,6 @@
 
 ## 成果物の置き場
 
-- 学習の途中状態・ログ: `Data/<モデル名>/models/`（G_/D_/WD_*.pth、tfevents。学習曲線は `uv run tensorboard --logdir Data/<モデル名>/models`）。
+- 学習の途中状態・ログ: `Data/<モデル名>/models/`（G_/D_/DUR_/WD_*.pth、tfevents。学習曲線は `uv run tensorboard --logdir Data/<モデル名>/models`）。
 - 推論・共有用3点セット: `model_assets/<モデル名>/`（config.json + `<モデル名>_e<epoch>_s<step>.safetensors` + `style_vectors.npy`）。共有時は3点をセットで渡すこと。名前が統一されていない場合は同じセットの style_vectors.npy/config.json が必要。
 - `pretrained/` の事前学習モデル（bert/jp_extra/slm）は前処理時に自動取得される。一括手動取得は `uv run -m train.initialize`。
