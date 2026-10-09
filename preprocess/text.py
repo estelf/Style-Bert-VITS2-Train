@@ -1,9 +1,9 @@
 import argparse
 import json
+import random
+import sys
 from collections import defaultdict
 from pathlib import Path
-from random import sample
-from typing import Optional
 
 from tqdm import tqdm
 
@@ -12,7 +12,6 @@ from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp import clean_text
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
-from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
 
 
 # このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
@@ -63,7 +62,7 @@ def process_line(
 
 def preprocess(
     transcription_path: Path,
-    cleaned_path: Optional[Path],
+    cleaned_path: Path | None,
     train_path: Path,
     val_path: Path,
     config_path: Path,
@@ -92,7 +91,7 @@ def preprocess(
         cleaned_path.open("w", encoding="utf-8") as out_file,
     ):
         for line in tqdm(
-            trans_file, file=SAFE_STDOUT, total=total_lines, dynamic_ncols=True
+            trans_file, file=sys.stdout, total=total_lines, dynamic_ncols=True
         ):
             try:
                 processed_line = process_line(
@@ -125,6 +124,7 @@ def preprocess(
         audio_paths: set[str] = set()
         count_same = 0
         count_not_found = 0
+        # 音声NotFound・重複行はここで黙って捨てられる（データ全体の問題は Step 3 の check_dataset が esd.list ↔ wavs/ を突き合わせて先に検出する）
         for line in f.readlines():
             utt, spk = line.strip().split("|")[:2]
             if utt in audio_paths:
@@ -147,6 +147,11 @@ def preprocess(
                 f"Total repeated audios: {count_same}, Total number of audio not found: {count_not_found}"
             )
 
+    # 検証・学習分割は決定論的でなければならないため、config.json の train.seed（既定42）でシードする
+    with config_path.open("r", encoding="utf-8") as f:
+        json_config = json.load(f)
+    rng = random.Random(json_config["train"]["seed"])
+
     train_list: list[str] = []
     val_list: list[str] = []
 
@@ -155,8 +160,9 @@ def preprocess(
         if val_per_lang == 0:
             train_list.extend(utts)
             continue
-        # ランダムにval_per_lang個のインデックスを選択
-        val_indices = set(sample(range(len(utts)), val_per_lang))
+        # ランダムにval_per_lang個のインデックスを選択（発話数が少数でも ValueError にならないよう上限で絞る）
+        n_val = min(val_per_lang, len(utts))
+        val_indices = set(rng.sample(range(len(utts)), n_val))
         # 元の順序を保ちながらリストを分割
         for index, utt in enumerate(utts):
             if index in val_indices:
@@ -179,9 +185,7 @@ def preprocess(
         for line in val_list:
             f.write(line)
 
-    with config_path.open("r", encoding="utf-8") as f:
-        json_config = json.load(f)
-
+    # json_config は分割前に読み込み済みのものを使う（train.seed でシードするため）
     json_config["data"]["spk2id"] = spk_id_map
     json_config["data"]["n_speakers"] = len(spk_id_map)
 
@@ -211,9 +215,7 @@ def preprocess(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model_name", "-m", type=str, required=True, help="モデル名"
-    )
+    parser.add_argument("--model_name", "-m", type=str, required=True, help="モデル名")
     # 「話者ごと」のバリデーションデータ数、言語ごとではない！
     # 元のコードや設定ファイルでval_per_langとなっていたので名前をそのままにしている
     parser.add_argument(

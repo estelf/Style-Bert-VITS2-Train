@@ -3,7 +3,7 @@
 コードと完全に一致している保証はない。あくまで参考程度とすること。
 """
 
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch.nn import functional as F
@@ -52,6 +52,31 @@ def convert_pad_shape(pad_shape: list[list[Any]]) -> list[Any]:
     return new_pad_shape
 
 
+def reflect_pad_1d(x: torch.Tensor, left: int = 0, right: int = 0) -> torch.Tensor:
+    """
+    F.pad(x, (left, right), mode="reflect") と同じ結果を決定論的な backward で行う
+
+    reflection_pad1d_backward は CUDA で決定論的実装を持たないため、use_deterministic_algorithms(True)
+    の学習でそのまま使えると非決定性が入る。flip/slice/cat だけで実装しており、コピーのみで
+    浮動小数点的にも F.pad(mode="reflect") と完全に一致する（挙動変更なし）。
+
+    Args:
+        x (torch.Tensor): 最終次元を反転パディングするテンソル
+        left (int): 左側のパディング量
+        right (int): 右側のパディング量
+
+    Returns:
+        torch.Tensor: 左右に合計 left+right 要素だけ反転パディングしたテンソル
+    """
+    parts = []
+    if left > 0:
+        parts.append(x[..., 1 : left + 1].flip(-1))
+    parts.append(x)
+    if right > 0:
+        parts.append(x[..., -right - 1 : -1].flip(-1))
+    return torch.cat(parts, dim=-1)
+
+
 def intersperse(lst: list[Any], item: Any) -> list[Any]:
     """
     リストの要素の間に特定のアイテムを挿入する
@@ -89,7 +114,7 @@ def slice_segments(
 
 
 def rand_slice_segments(
-    x: torch.Tensor, x_lengths: Optional[torch.Tensor] = None, segment_size: int = 4
+    x: torch.Tensor, x_lengths: torch.Tensor | None = None, segment_size: int = 4
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     ランダムなセグメントをスライスする
@@ -148,9 +173,7 @@ def fused_add_tanh_sigmoid_multiply(
     return acts
 
 
-def sequence_mask(
-    length: torch.Tensor, max_length: Optional[int] = None
-) -> torch.Tensor:
+def sequence_mask(length: torch.Tensor, max_length: int | None = None) -> torch.Tensor:
     """
     シーケンスマスクを生成する
 
@@ -190,8 +213,8 @@ def generate_path(duration: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 def clip_grad_value_(
-    parameters: Union[torch.Tensor, list[torch.Tensor]],
-    clip_value: Optional[float],
+    parameters: torch.Tensor | list[torch.Tensor],
+    clip_value: float | None,
     norm_type: float = 2.0,
 ) -> float:
     """

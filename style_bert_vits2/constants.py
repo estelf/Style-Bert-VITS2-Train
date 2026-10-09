@@ -1,11 +1,12 @@
 import os
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 from style_bert_vits2.utils.strenum import StrEnum
 
 
-# Style-Bert-VITS2 のバージョン（pyproject.toml の [project].version と必ず揃える）
-VERSION = "2.7.0"
+# Style-Bert-VITS2 のバージョン（インストール済みパッケージのメタデータ = pyproject.toml の [project].version から取得する）
+VERSION = _pkg_version("style-bert-vits2")
 
 # Style-Bert-VITS2 のベースディレクトリ
 BASE_DIR = Path(__file__).parent.parent
@@ -34,7 +35,9 @@ class Languages(StrEnum):
 
 
 # 日本語 BERT モデルのデフォルトパス
-DEFAULT_BERT_MODEL_PATH = BASE_DIR / "pretrained" / "bert" / "deberta-v2-large-japanese-char-wwm"
+DEFAULT_BERT_MODEL_PATH = (
+    BASE_DIR / "pretrained" / "bert" / "deberta-v2-large-japanese-char-wwm"
+)
 
 # デフォルトのユーザー辞書ディレクトリ
 ## style_bert_vits2.nlp.japanese.user_dict モジュールのデフォルト値として利用される
@@ -50,7 +53,6 @@ DEFAULT_NOISEW = 0.8
 DEFAULT_LENGTH = 1.0
 DEFAULT_LINE_SPLIT = True
 DEFAULT_SPLIT_INTERVAL = 0.5
-DEFAULT_ASSIST_TEXT_WEIGHT = 0.7
 DEFAULT_ASSIST_TEXT_WEIGHT = 1.0
 
 # Gradio のテーマ

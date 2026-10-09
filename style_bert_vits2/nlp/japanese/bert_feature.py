@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
-
-from numpy.typing import NDArray
+from typing import TYPE_CHECKING
 
 from style_bert_vits2.nlp import bert_models
 from style_bert_vits2.nlp.japanese.g2p import text_to_sep_kata
@@ -16,7 +14,7 @@ def extract_bert_feature(
     text: str,
     word2ph: list[int],
     device: str,
-    assist_text: Optional[str] = None,
+    assist_text: str | None = None,
     assist_text_weight: float = 0.7,
 ) -> torch.Tensor:
     """
@@ -79,4 +77,3 @@ def extract_bert_feature(
     phone_level_feature = torch.cat(phone_level_feature, dim=0)
 
     return phone_level_feature.T
-

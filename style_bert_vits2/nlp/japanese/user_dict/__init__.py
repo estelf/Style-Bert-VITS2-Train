@@ -9,11 +9,9 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional
 from uuid import UUID, uuid4
 
 import numpy as np
-from fastapi import HTTPException
 
 from style_bert_vits2.constants import DEFAULT_USER_DICT_DIR
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker as pyopenjtalk
@@ -40,13 +38,17 @@ compiled_dict_path = (
 )  # コンパイル済み辞書ファイルのパス
 
 
+class UserDictError(ValueError):
+    """ユーザー辞書操作時のエラー（API サーバー廃止に伴い HTTPException の代わり。旧 status_code=422 相当）"""
+
+
 # # 同時書き込みの制御
 # mutex_user_dict = threading.Lock()
 # mutex_openjtalk_dict = threading.Lock()
 
 
 # @mutex_wrapper(mutex_user_dict)
-def _write_to_json(user_dict: Dict[str, UserDictWord], user_dict_path: Path) -> None:
+def _write_to_json(user_dict: dict[str, UserDictWord], user_dict_path: Path) -> None:
     """
     ユーザー辞書ファイルへのユーザー辞書データ書き込み
     Parameters
@@ -167,7 +169,7 @@ def update_dict(
 
 
 # @mutex_wrapper(mutex_user_dict)
-def read_dict(user_dict_path: Path = user_dict_path) -> Dict[str, UserDictWord]:
+def read_dict(user_dict_path: Path = user_dict_path) -> dict[str, UserDictWord]:
     """
     ユーザー辞書の読み出し
     Parameters
@@ -184,7 +186,7 @@ def read_dict(user_dict_path: Path = user_dict_path) -> Dict[str, UserDictWord]:
         return {}
 
     with user_dict_path.open(encoding="utf-8") as f:
-        result: Dict[str, UserDictWord] = {}
+        result: dict[str, UserDictWord] = {}
         for word_uuid, word in json.load(f).items():
             # cost2priorityで変換を行う際にcontext_idが必要となるが、
             # 0.12以前の辞書は、context_idがハードコーディングされていたためにユーザー辞書内に保管されていない
@@ -204,8 +206,8 @@ def _create_word(
     surface: str,
     pronunciation: str,
     accent_type: int,
-    word_type: Optional[WordTypes] = None,
-    priority: Optional[int] = None,
+    word_type: WordTypes | None = None,
+    priority: int | None = None,
 ) -> UserDictWord:
     """
     単語オブジェクトの生成
@@ -229,11 +231,11 @@ def _create_word(
     if word_type is None:
         word_type = WordTypes.PROPER_NOUN
     if word_type not in part_of_speech_data.keys():
-        raise HTTPException(status_code=422, detail="不明な品詞です")
+        raise UserDictError("不明な品詞です")
     if priority is None:
         priority = 5
     if not MIN_PRIORITY <= priority <= MAX_PRIORITY:
-        raise HTTPException(status_code=422, detail="優先度の値が無効です")
+        raise UserDictError("優先度の値が無効です")
     pos_detail = part_of_speech_data[word_type]
     return UserDictWord(
         surface=surface,
@@ -257,8 +259,8 @@ def apply_word(
     surface: str,
     pronunciation: str,
     accent_type: int,
-    word_type: Optional[WordTypes] = None,
-    priority: Optional[int] = None,
+    word_type: WordTypes | None = None,
+    priority: int | None = None,
     user_dict_path: Path = user_dict_path,
     compiled_dict_path: Path = compiled_dict_path,
 ) -> str:
@@ -309,8 +311,8 @@ def rewrite_word(
     surface: str,
     pronunciation: str,
     accent_type: int,
-    word_type: Optional[WordTypes] = None,
-    priority: Optional[int] = None,
+    word_type: WordTypes | None = None,
+    priority: int | None = None,
     user_dict_path: Path = user_dict_path,
     compiled_dict_path: Path = compiled_dict_path,
 ) -> None:
@@ -346,9 +348,7 @@ def rewrite_word(
     # 既存単語の上書きによる辞書データの更新
     user_dict = read_dict(user_dict_path=user_dict_path)
     if word_uuid not in user_dict:
-        raise HTTPException(
-            status_code=422, detail="UUIDに該当するワードが見つかりませんでした"
-        )
+        raise UserDictError("UUIDに該当するワードが見つかりませんでした")
     user_dict[word_uuid] = word
 
     # 更新された辞書データの保存と適用
@@ -375,9 +375,7 @@ def delete_word(
     # 既存単語の削除による辞書データの更新
     user_dict = read_dict(user_dict_path=user_dict_path)
     if word_uuid not in user_dict:
-        raise HTTPException(
-            status_code=422, detail="IDに該当するワードが見つかりませんでした"
-        )
+        raise UserDictError("IDに該当するワードが見つかりませんでした")
     del user_dict[word_uuid]
 
     # 更新された辞書データの保存と適用
@@ -386,7 +384,7 @@ def delete_word(
 
 
 def import_user_dict(
-    dict_data: Dict[str, UserDictWord],
+    dict_data: dict[str, UserDictWord],
     override: bool = False,
     user_dict_path: Path = user_dict_path,
     default_dict_path: Path = default_dict_path,
@@ -450,11 +448,11 @@ def import_user_dict(
     )
 
 
-def _search_cost_candidates(context_id: int) -> List[int]:
+def _search_cost_candidates(context_id: int) -> list[int]:
     for value in part_of_speech_data.values():
         if value.context_id == context_id:
             return value.cost_candidates
-    raise HTTPException(status_code=422, detail="品詞IDが不正です")
+    raise UserDictError("品詞IDが不正です")
 
 
 def _cost2priority(context_id: int, cost: int) -> int:

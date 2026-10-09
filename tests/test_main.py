@@ -3,10 +3,16 @@
 テストデータは tests/data/<モデル名>/（esd.list + raw.zip の完成済みデータセット契約の例）に置く。
 ・データセット・ゴールデンデータは git に含まれないので、開発時に各自で用意する（git clone 直後は存在しないのが正常）
 ・差し替え: データセットを tests/data/ に置いて SBV2_TEST_MODEL を変えるだけでよい（DATASET_ROOT は自動で tests/data に向く）
-・ゴールデンデータについて: 学習は意図的に1エポック（シード固定）しか行わないため重みはノイズ混じりだが、
+・学習は毎回必ず行う（model_assets/ に成果物が残っていてもスキップしない。step1 の initialize は reset_models=True で
+  models/ を事前学習モデル（G_0.safetensors）からリセットするため、常に同じ初期状態の1エポックになり、
+  ゴールデン音声との比較が決定論的に保たれ、train/ の変更は必ず検出される）
+・ゴールデンデータについて: 学習は意図的に1エポック（シード固定42）しか行わないため重みはノイズ混じりだが、
   その出力こそがゴールデン（tests/references/）である。目的は品質検証ではなく、transformers 等のバージョン変更で
   BERT 出力＝推論結果が破壊的に変わったことを相関差分検知するためのもので、「1エポックのノイズ音声」でも契約として一致を見る必要がある。
-・ついでにコアライブラリのフルFP16推論（重みごと半精度でキャストして推論）のスモークテストも行う。
+  ※train/pipeline.py で torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG を有効化しているため、
+    GPU 学習でもビット単位で再現可能。音声長・波形ともゴールデンと一致して初めて通る強い契約チェックになっている。
+・train/pipeline.py は nccl / torch.cuda.set_device() / .cuda() を無条件に使うため CPU では学習できない（CPU 学習非対応）。
+  よって学習を伴うテストは CUDA がある環境でのみ実行され、無い環境では skip される。
 """
 
 import os
@@ -19,6 +25,7 @@ import pytest
 import torch
 from scipy.io import wavfile
 
+
 # style_bert_vits2 / preprocess を import する前にデータセットルート差し替えを示す（サブプロセスにも継承される）
 TEST_DATA_ROOT = Path(__file__).parent / "data"
 os.environ["SBV2_DATASET_ROOT"] = str(TEST_DATA_ROOT)
@@ -27,6 +34,7 @@ import preprocess as preprocess_pkg  # noqa: E402
 from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT  # noqa: E402
 from style_bert_vits2.logging import logger  # noqa: E402
 from style_bert_vits2.tts_model import TTSModel  # noqa: E402
+
 
 # 入れ替え可能なテストデータセット名（tests/data/<モデル名> を使う）
 MODEL_NAME = os.environ.get(
@@ -45,13 +53,13 @@ TEST_STYLE = "Neutral"
 def _prepare_dataset():
     """テストデータセットを学習可能な状態に前処理する（環境構築ダウンロード → Step 1〜6）。
 
-    毎回必ず全ステップを実行する（冪等な処理ばかりで、BERT特徴・スタイル特徴は既存ファイルがあれば再利用され速い）。
-    特に Step 1 の initialize が models/ を事前学習モデル（G_0.safetensors）でリセットするため、
+    毎回必ず全ステップを実行する（BERT特徴・スタイル特徴は既存ファイルがあれば再利用され速い）。
+    特に Step 1 の initialize は reset_models=True で models/ を事前学習モデルでリセットするので、
     学習は常に同じ初期状態の1エポックになり、ゴールデン音声との比較が決定論的に保たれる。
     """
-    if not DATASET_PATH.exists():
+    if not (DATASET_PATH / "esd.list").is_file() or not (DATASET_PATH / "raw.zip").is_file():
         pytest.skip(
-            f"テストデータセット {DATASET_PATH} がありません。"
+            f"テストデータセット {DATASET_PATH}（esd.list + raw.zip）が未配置です。"
             "データセットは git に含まれないため、各自で tests/data/<モデル名>/ に配置してください"
             f"（現在のデフォルト: SBV2_TEST_MODEL={MODEL_NAME}）。"
         )
@@ -68,15 +76,25 @@ def _prepare_dataset():
         log_interval=1000,
         val_per_lang=0,
         yomi_error="raise",
+        reset_models=True,  # 前回の学習チェックポイントを残さず、毎回同じ初期状態から1エポック学習する
     )
 
 
-def _train_short():
-    """学習を1エポックだけ実行し、モデルを model_assets/ に保存する（決定論的: seed は config の 42 固定）"""
-    g_files = sorted(MODELS_PATH.glob("*.safetensors"))
-    if len(g_files) > 0:
-        logger.info("Trained model already exists. Skip training.")
-        return g_files[0]
+@pytest.fixture(scope="module")
+def trained_model_path() -> Path:
+    """前処理（Step 1〜6）→ 必ず1エポック学習を実行し、今回生成された .safetensors を返す。
+
+    成果物をクリアしてから毎回学習するので、train/ の変更は必ず検出される（古いモデルで推論するだけにならない）。
+    学習パイプラインは CUDA 必須のため、GPU が無い環境ではここで skip する。テスト同士の順序・実行履歴に依存しない。
+    """
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "train/pipeline.py は nccl / .cuda() を無条件に使うため学習が CPU では動作しない（CUDA 環境でのみ実行）"
+        )
+    _prepare_dataset()
+    # 前回実行の成果物を消し、必ず今回の学習結果を使う
+    for stale in MODELS_PATH.glob("*.safetensors"):
+        stale.unlink()
     subprocess.run(
         [sys.executable, "-m", "train.pipeline", "--model_name", MODEL_NAME],
         check=True,
@@ -86,9 +104,8 @@ def _train_short():
     return g_files[0]
 
 
-def synthesize_and_compare():
+def synthesize_and_compare(model_file: Path):
     """固定テキスト＋固定スタイルで合成し、ゴールデン音声（1エポック学習ノイズモデルの決定論的出力）と差分比較する"""
-    model_file = _train_short()
 
     # 学習済みモデル（.safetensors）+ style_vectors.npy + config.json の構成でロード
     model = TTSModel(
@@ -120,11 +137,15 @@ def synthesize_and_compare():
 
     ref_sr, ref_audio = wavfile.read(reference_path)
     assert ref_sr == sample_rate, "サンプリングレートが参照音声と一致しません"
-    assert len(ref_audio) == len(
-        audio
-    ), f"音声長が参照音声と一致しません: {len(audio)} != {len(ref_audio)}"
+    # 学習（use_deterministic_algorithms + CUBLAS_WORKSPACE_CONFIG）と合成はビット単位で再現可能なので、
+    # duration の ceil() 量子化も含めて音声長は完全一致してこそ契約である（ズレたら何か壊れた証拠）
+    assert len(audio) == len(ref_audio), (
+        f"音声長が参照音声と一致しません: {len(audio)} != {len(ref_audio)}"
+    )
 
     # 相関による差分閾値テスト（完全一致ではなく破壊的変更の検知が目的）
+    n = min(len(audio), len(ref_audio))
+    audio, ref_audio = audio[:n], ref_audio[:n]
     a = audio.astype(np.float64) / np.abs(audio).max()
     b = ref_audio.astype(np.float64) / np.abs(ref_audio).max()
     corr = float(np.corrcoef(a, b)[0, 1])
@@ -135,32 +156,23 @@ def synthesize_and_compare():
     )
 
 
-def test_pipeline_and_synthesize_cpu():
-    """CPU でも動くスモークテスト（前処理 → 学習 → 合成 → ゴールデン音声との差分比較）"""
-    _prepare_dataset()
-    synthesize_and_compare()
+def test_pipeline_and_synthesize(trained_model_path):
+    """前処理 → 学習（毎回実行・seed 42 で決定論的）→ 合成 → ゴールデン音声との差分比較の本番構成回帰テスト"""
+    synthesize_and_compare(trained_model_path)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_pipeline_and_synthesize_cuda():
-    """GPU を使った本番構成での回帰テスト"""
-    _prepare_dataset()
-    synthesize_and_compare()
-
-
-def test_infer_full_half_precision():
+def test_infer_full_half_precision(trained_model_path):
     """コアライブラリのフルFP16推論スモークテスト（重みごと半精度にキャストして合成できること）
     ※bfloat16 は仮数が8ビットしかなく duration の ceil() 量子化と組み合わせて精度劣化が大きいため廃止済み"""
-    model_file = _train_short()
     with pytest.raises(ValueError):
         TTSModel(
-            model_path=model_file,
+            model_path=trained_model_path,
             config_path=MODELS_PATH / "config.json",
             style_vec_path=MODELS_PATH / "style_vectors.npy",
             dtype="bfloat16",
         )
     model = TTSModel(
-        model_path=model_file,
+        model_path=trained_model_path,
         config_path=MODELS_PATH / "config.json",
         style_vec_path=MODELS_PATH / "style_vectors.npy",
         device="cuda" if torch.cuda.is_available() else "cpu",

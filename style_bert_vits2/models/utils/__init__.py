@@ -4,15 +4,17 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from numpy.typing import NDArray
 
 from style_bert_vits2.logging import logger
-from style_bert_vits2.models.utils import checkpoints  # type: ignore # noqa: F401
-from style_bert_vits2.models.utils import safetensors  # type: ignore # noqa: F401
+from style_bert_vits2.models.utils import (
+    checkpoints,  # type: ignore # noqa: F401
+    safetensors,  # type: ignore # noqa: F401
+)
 
 
 if TYPE_CHECKING:
@@ -54,7 +56,7 @@ def summarize(
         writer.add_audio(k, v, global_step, audio_sampling_rate)
 
 
-def is_resuming(dir_path: Union[str, Path]) -> bool:
+def is_resuming(dir_path: str | Path) -> bool:
     """
     指定されたディレクトリパスに再開可能なモデルが存在するかどうかを返す
 
@@ -108,7 +110,7 @@ def plot_spectrogram_to_numpy(spectrogram: NDArray[Any]) -> NDArray[Any]:
 
 
 def plot_alignment_to_numpy(
-    alignment: NDArray[Any], info: Optional[str] = None
+    alignment: NDArray[Any], info: str | None = None
 ) -> NDArray[Any]:
     """
     指定されたアライメントを画像データに変換する
@@ -150,7 +152,7 @@ def plot_alignment_to_numpy(
     return data
 
 
-def load_wav_to_torch(full_path: Union[str, Path]) -> tuple[torch.FloatTensor, int]:
+def load_wav_to_torch(full_path: str | Path) -> tuple[torch.FloatTensor, int]:
     """
     指定された音声ファイルを読み込み、PyTorch のテンソルに変換して返す
 
@@ -174,9 +176,7 @@ def load_wav_to_torch(full_path: Union[str, Path]) -> tuple[torch.FloatTensor, i
     return torch.from_numpy(np.ascontiguousarray(data)), sampling_rate
 
 
-def load_filepaths_and_text(
-    filename: Union[str, Path], split: str = "|"
-) -> list[list[str]]:
+def load_filepaths_and_text(filename: str | Path, split: str = "|") -> list[list[str]]:
     """
     指定されたファイルからファイルパスとテキストを読み込む
 
@@ -194,7 +194,7 @@ def load_filepaths_and_text(
 
 
 def get_logger(
-    model_dir_path: Union[str, Path], filename: str = "train.log"
+    model_dir_path: str | Path, filename: str = "train.log"
 ) -> logging.Logger:
     """
     ロガーを取得する
@@ -221,7 +221,7 @@ def get_logger(
     return logger
 
 
-def get_steps(model_path: Union[str, Path]) -> Optional[int]:
+def get_steps(model_path: str | Path) -> int | None:
     """
     モデルのパスからイテレーション回数を取得する
 
@@ -236,22 +236,21 @@ def get_steps(model_path: Union[str, Path]) -> Optional[int]:
     return matches[-1] if matches else None
 
 
-def check_git_hash(model_dir_path: Union[str, Path]) -> None:
+def check_git_hash(model_dir_path: str | Path) -> None:
     """
-    モデルのディレクトリに .git ディレクトリが存在する場合、ハッシュ値を比較する
+    リポジトリの git ハッシュ値をモデルディレクトリの githash と比較する（git 管理外なら黙ってスキップ。毎回警告出していても気づけない）
 
     Args:
         model_dir_path (Union[str, Path]): モデルのディレクトリのパス
     """
 
-    source_dir = os.path.dirname(os.path.realpath(__file__))
-    if not os.path.exists(os.path.join(source_dir, ".git")):
-        logger.warning(
-            f"{source_dir} is not a git repository, therefore hash value comparison will be ignored."
+    # git はカレントディレクトリから上位を辿ってリポジトリを探すため、パッケージ内の .git を探す必要はない
+    cur_hash = subprocess.getoutput("git rev-parse HEAD")
+    if "fatal:" in cur_hash or not cur_hash.strip():
+        logger.debug(
+            "The current directory is not a git repository, so hash value comparison will be ignored."
         )
         return
-
-    cur_hash = subprocess.getoutput("git rev-parse HEAD")
 
     path = os.path.join(model_dir_path, "githash")
     if os.path.exists(path):

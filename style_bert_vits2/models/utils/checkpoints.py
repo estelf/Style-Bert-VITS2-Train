@@ -2,21 +2,26 @@ import glob
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 
 from style_bert_vits2.logging import logger
 
 
+# チェックポイントとモデルの不一致キー（欠損・形状不一致）がこの件数を超えたら停止する
+# （少数の不一致は旧バージョン互換の再初期化で許容するが、話者数ミス設定のような大規模な不一致は黙って通さない）
+MAX_MISMATCHED_KEYS = 8
+
+
 def load_checkpoint(
-    checkpoint_path: Union[str, Path],
+    checkpoint_path: str | Path,
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer: torch.optim.Optimizer | None = None,
     skip_optimizer: bool = False,
     for_infer: bool = False,
-    device: Union[str, torch.device] = "cpu",
-) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], float, int]:
+    device: str | torch.device = "cpu",
+) -> tuple[torch.nn.Module, torch.optim.Optimizer | None, float, int]:
     """
     指定されたパスからチェックポイントを読み込み、モデルとオプティマイザーを更新する。
 
@@ -29,6 +34,9 @@ def load_checkpoint(
 
     Returns:
         tuple[torch.nn.Module, Optional[torch.optim.Optimizer], float, int]: 更新されたモデルとオプティマイザー、学習率、イテレーション回数
+
+    Raises:
+        ValueError: 欠損キー・形状不一致キーが MAX_MISMATCHED_KEYS 件を超えた場合
     """
 
     assert os.path.isfile(checkpoint_path)
@@ -44,13 +52,6 @@ def load_checkpoint(
         and checkpoint_dict["optimizer"] is not None
     ):
         optimizer.load_state_dict(checkpoint_dict["optimizer"])
-    elif optimizer is None and not skip_optimizer:
-        # else:      Disable this line if Infer and resume checkpoint,then enable the line upper
-        new_opt_dict = optimizer.state_dict()  # type: ignore
-        new_opt_dict_params = new_opt_dict["param_groups"][0]["params"]
-        new_opt_dict["param_groups"] = checkpoint_dict["optimizer"]["param_groups"]
-        new_opt_dict["param_groups"][0]["params"] = new_opt_dict_params
-        optimizer.load_state_dict(new_opt_dict)  # type: ignore
 
     saved_state_dict = checkpoint_dict["model"]
     if hasattr(model, "module"):
@@ -59,27 +60,43 @@ def load_checkpoint(
         state_dict = model.state_dict()
 
     new_state_dict = {}
+    # 形状不一致・キー欠落を握り潰さず集計する（例: 話者数を変えて再開すると emb_g だけが黙って再初期化される）
+    mismatched_keys: list[str] = []
     for k, v in state_dict.items():
-        try:
-            # assert "emb_g" not in k
-            new_state_dict[k] = saved_state_dict[k]
-            assert saved_state_dict[k].shape == v.shape, (
-                saved_state_dict[k].shape,
-                v.shape,
-            )
-        except:
+        if k not in saved_state_dict:
             # For upgrading from the old version
-            if "ja_bert_proj" in k:
-                v = torch.zeros_like(v)
-                logger.warning(
-                    f"Seems you are using the old version of the model, the {k} is automatically set to zero for backward compatibility"
-                )
-            elif "enc_q" in k and for_infer:
+            if "enc_q" in k and for_infer:
                 continue
-            else:
-                logger.error(f"{k} is not in the checkpoint {checkpoint_path}")
-
+            mismatched_keys.append(k)
+            logger.error(f"{k} is not in the checkpoint {checkpoint_path}")
             new_state_dict[k] = v
+            continue
+        if saved_state_dict[k].shape == v.shape:
+            new_state_dict[k] = saved_state_dict[k]
+        elif "ja_bert_proj" in k:
+            # For upgrading from the old version
+            v = torch.zeros_like(v)
+            logger.warning(
+                f"Seems you are using the old version of the model, the {k} is automatically set to zero for backward compatibility"
+            )
+            new_state_dict[k] = v
+        else:
+            mismatched_keys.append(k)
+            logger.error(
+                f"Shape mismatch for {k}: checkpoint {tuple(saved_state_dict[k].shape)} != model {tuple(v.shape)}. It will be re-initialized."
+            )
+            new_state_dict[k] = v
+
+    if len(mismatched_keys) > MAX_MISMATCHED_KEYS:
+        raise ValueError(
+            f"{len(mismatched_keys)} keys are missing or shape-mismatched in {checkpoint_path} "
+            f"(threshold {MAX_MISMATCHED_KEYS}, e.g.: {mismatched_keys[:5]}). "
+            "The checkpoint does not match the current model configuration. Please check config.json (n_speakers etc.)."
+        )
+    elif mismatched_keys:
+        logger.warning(
+            f"{len(mismatched_keys)} keys were missing or shape-mismatched and re-initialized from {checkpoint_path}: {mismatched_keys}"
+        )
 
     if hasattr(model, "module"):
         model.module.load_state_dict(new_state_dict, strict=False)
@@ -93,10 +110,10 @@ def load_checkpoint(
 
 def save_checkpoint(
     model: torch.nn.Module,
-    optimizer: Union[torch.optim.Optimizer, torch.optim.AdamW],
+    optimizer: torch.optim.Optimizer | torch.optim.AdamW,
     learning_rate: float,
     iteration: int,
-    checkpoint_path: Union[str, Path],
+    checkpoint_path: str | Path,
 ) -> None:
     """
     モデルとオプティマイザーの状態を指定されたパスに保存する。
@@ -127,7 +144,7 @@ def save_checkpoint(
 
 
 def clean_checkpoints(
-    model_dir_path: Union[str, Path] = "logs/44k/",
+    model_dir_path: str | Path = "logs/44k/",
     n_ckpts_to_keep: int = 2,
     sort_by_time: bool = True,
 ) -> None:
@@ -180,7 +197,7 @@ def clean_checkpoints(
 
 
 def get_latest_checkpoint_path(
-    model_dir_path: Union[str, Path], regex: str = "G_*.pth"
+    model_dir_path: str | Path, regex: str = "G_*.pth"
 ) -> str:
     """
     指定されたディレクトリから最新のチェックポイントのパスを取得する

@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from numpy.typing import NDArray
@@ -20,7 +20,7 @@ def get_net_g(
     version: str,
     device: str,
     hps: HyperParameters,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ) -> SynthesizerTrn:
     """JP-Extra モデルをデバイスにロードする。
 
@@ -69,7 +69,9 @@ def get_net_g(
         raise ValueError(f"Unknown model format: {model_path}")
     if dtype is not None and dtype != torch.float32:
         # フルFP16推論: 重みごとキャストする（学習時と同様に全レイヤが半精度で動く）
-        logger.info(f"Casting model weights to {dtype} for full half-precision inference")
+        logger.info(
+            f"Casting model weights to {dtype} for full half-precision inference"
+        )
         net_g = net_g.to(dtype)
     return net_g
 
@@ -78,10 +80,10 @@ def get_text(
     text: str,
     hps: HyperParameters,
     device: str,
-    assist_text: Optional[str] = None,
+    assist_text: str | None = None,
     assist_text_weight: float = 0.7,
-    given_phone: Optional[list[str]] = None,
-    given_tone: Optional[list[int]] = None,
+    given_phone: list[str] | None = None,
+    given_tone: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     norm_text, phone, tone, word2ph = clean_text_with_given_phone_tone(
         text,
@@ -109,8 +111,8 @@ def get_text(
     del word2ph
     assert ja_bert.shape[-1] == len(phone), phone
 
-    assert (
-        ja_bert.shape[-1] == len(phone)
+    assert ja_bert.shape[-1] == len(
+        phone
     ), f"Bert seq len {ja_bert.shape[-1]} != {len(phone)}"
 
     phone = torch.LongTensor(phone)
@@ -132,10 +134,10 @@ def infer(
     device: str,
     skip_start: bool = False,
     skip_end: bool = False,
-    assist_text: Optional[str] = None,
+    assist_text: str | None = None,
     assist_text_weight: float = 0.7,
-    given_phone: Optional[list[str]] = None,
-    given_tone: Optional[list[int]] = None,
+    given_phone: list[str] | None = None,
+    given_tone: list[int] | None = None,
 ) -> NDArray[Any]:
     ja_bert, phones, tones, lang_ids = get_text(
         text,
@@ -167,7 +169,9 @@ def infer(
         ja_bert = ja_bert.to(device=device, dtype=model_dtype).unsqueeze(0)
         x_tst_lengths = torch.LongTensor([phones.size(0)]).to(device)
         style_vec_tensor = (
-            torch.from_numpy(style_vec).to(device=device, dtype=model_dtype).unsqueeze(0)
+            torch.from_numpy(style_vec)
+            .to(device=device, dtype=model_dtype)
+            .unsqueeze(0)
         )
         del phones
         sid_tensor = torch.LongTensor([sid]).to(device)

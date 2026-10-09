@@ -1,4 +1,5 @@
 import argparse
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -12,7 +13,6 @@ from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.nlp import cleaned_text_to_sequence, extract_bert_feature
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
-from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
 
 
 # このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
@@ -56,9 +56,7 @@ def process_line(x: tuple[str, bool]):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model_name", "-m", type=str, required=True, help="モデル名"
-    )
+    parser.add_argument("--model_name", "-m", type=str, required=True, help="モデル名")
     args, _ = parser.parse_known_args()
     config_path = DATASET_ROOT / args.model_name / "config.json"
     hps = HyperParameters.load_from_json(config_path)
@@ -78,7 +76,7 @@ if __name__ == "__main__":
                 tqdm(
                     executor.map(process_line, zip(lines, add_blank)),
                     total=len(lines),
-                    file=SAFE_STDOUT,
+                    file=sys.stdout,
                     dynamic_ncols=True,
                 )
             )

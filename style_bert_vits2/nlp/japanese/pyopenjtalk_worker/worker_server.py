@@ -74,7 +74,9 @@ class WorkerServer:
         logger.info("start pyopenjtalk worker server")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(("localhost", port))  # WSL2 mirrored network 等を考慮し、hostname でなく明示的に localhost に bind する
+            server_socket.bind(
+                ("localhost", port)
+            )  # WSL2 mirrored network 等を考慮し、hostname でなく明示的に localhost に bind する
             server_socket.listen()
             sockets = [server_socket]
             no_client_since = time.time()

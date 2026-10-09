@@ -15,6 +15,7 @@ from style_bert_vits2.constants import DATASET_ROOT
 from style_bert_vits2.logging import logger
 from style_bert_vits2.utils.subprocess import run_script_with_log
 
+
 __all__ = [
     "initialize",
     "extract_raw",
@@ -27,16 +28,21 @@ __all__ = [
 
 
 def check_dataset(model_name: str) -> None:
-    """Step 3: 学習データが正しい形（ターゲットのサンプリングレート・モノラル）か特徴量生成前に検証する。
+    """Step 3: 学習データが正しい形（サンプリングレート・モノラル・学習可能な尺・esd.list との整合）か特徴量生成前に検証する。
 
     Raises:
-        ValueError: 不正な形の音声ファイルが見つかった場合
+        ValueError: 不正な形の音声ファイルや esd.list と wavs/ の不一致が見つかった場合
     """
     logger.info("Step 3: start checking dataset...")
     dataset_path = DATASET_ROOT / model_name
     with open(dataset_path / "config.json", encoding="utf-8") as f:
-        sampling_rate = json.load(f)["data"]["sampling_rate"]
-    check_wavs(wavs_dir=dataset_path / "wavs", sampling_rate=sampling_rate)
+        data_config = json.load(f)["data"]
+    check_wavs(
+        wavs_dir=dataset_path / "wavs",
+        sampling_rate=data_config["sampling_rate"],
+        hop_length=data_config["hop_length"],
+        transcription_path=dataset_path / "esd.list",
+    )
     logger.success("Step 3: dataset check finished.")
 
 
@@ -106,19 +112,19 @@ def preprocess_all(
     epochs: int = 100,
     save_every_steps: int = 1000,
     num_processes: int = 2,
-    freeze_JP_bert: bool = True,
+    freeze_JP_bert: bool = False,
     freeze_style: bool = False,
     freeze_decoder: bool = False,
     val_per_lang: int = 0,
     log_interval: int = 200,
     yomi_error: str = "raise",
-    dtype: str = "float32",
+    reset_models: bool = False,
 ) -> None:
     """前処理チェーン全体（Step 1〜6）を順番に実行する。
 
     Args:
         model_name (str): データセット名（Data/<モデル名> を使う・作る）
-        dtype (str): 学習時の計算精度 ("bfloat16" / "float32")。config.json に書き込まれる
+        reset_models (bool): True の場合のみ models/ をバックアップして事前学習モデルでリセットする。既定では既存チェックポイントを上書きしない
         yomi_error (str): 読み上げエラー時の挙動。Options: raise, skip, use
 
     Raises:
@@ -146,7 +152,7 @@ def preprocess_all(
         freeze_style=freeze_style,
         freeze_decoder=freeze_decoder,
         log_interval=log_interval,
-        dtype=dtype,
+        reset_models=reset_models,
     )
     extract_raw(model_name=model_name)
     check_dataset(model_name=model_name)

@@ -1,19 +1,21 @@
 import os
 import random
 import sys
+from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
-from pathlib import Path
 import torch.utils.data
 from tqdm import tqdm
 
-from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons
 from style_bert_vits2.models.hyper_parameters import HyperParametersData
 from style_bert_vits2.models.utils import load_filepaths_and_text, load_wav_to_torch
 from style_bert_vits2.nlp import cleaned_text_to_sequence
+from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
+
 
 """Multi speaker version"""
 
@@ -63,12 +65,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         Filter text & store spec lengths
         """
         # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
+        # ヘッダの正確なサンプル数から、spectrogram_torch / mel_spectrogram_torch（center=False、
+        #   両側に int((filter_length - hop_length) / 2) の reflect パディング）が実際に出力する
+        #   フレーム数を再現して使う（旧方式のファイルサイズ近似は FLAC の圧縮率でズレていた）
 
         audiopaths_sid_text_new = []
         lengths = []
         skipped = 0
+        # spectrogram_torch / mel_spectrogram_torch が STFT 前に両側に足すパディング総量
+        pad = 2 * int((self.filter_length - self.hop_length) / 2)
         logger.info("Init dataset...")
         for _id, spk, language, text, phones, tone, word2ph in tqdm(
             self.audiopaths_sid_text, file=sys.stdout, dynamic_ncols=True
@@ -81,7 +86,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             audiopaths_sid_text_new.append(
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
-            lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+            # ヘッダ情報から正確なサンプル数を読み、center=False の STFT 出力フレーム数を再現する
+            with sf.SoundFile(audiopath) as f:
+                frames = f.frames
+            lengths.append((frames + pad - self.win_length) // self.hop_length + 1)
             # else:
             #     skipped += 1
         logger.info(
@@ -118,9 +126,32 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         spec_filename = str(Path(filename).with_suffix(".spec.pt"))
         if self.use_mel_spec_posterior:
             spec_filename = spec_filename.replace(".spec.pt", ".mel.pt")
-        try:
-            spec = torch.load(spec_filename)
-        except:
+        # キャッシュキーに STFT 設定を持たせ、filter_length/hop_length/win_length/sampling_rate を
+        # 変えたときに古いスペクトログラムで学習が進まないようにする（旧形式や不一致なら作り直す）
+        stft_params = {
+            "filter_length": self.filter_length,
+            "hop_length": self.hop_length,
+            "win_length": self.win_length,
+            "sampling_rate": self.sampling_rate,
+            "use_mel_spec_posterior": self.use_mel_spec_posterior,
+            "n_mel_channels": (
+                self.n_mel_channels if self.use_mel_spec_posterior else None
+            ),
+            "mel_fmin": self.hparams.mel_fmin if self.use_mel_spec_posterior else None,
+            "mel_fmax": self.hparams.mel_fmax if self.use_mel_spec_posterior else None,
+        }
+        spec = None
+        if os.path.exists(spec_filename):
+            try:
+                cached = torch.load(spec_filename, weights_only=True)
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("stft_params") == stft_params
+                ):
+                    spec = cached["spec"]
+            except Exception:
+                pass  # 旧形式（生のテンソルのみ）や読み込み失敗は再計算対象
+        if spec is None:
             if self.use_mel_spec_posterior:
                 spec = mel_spectrogram_torch(
                     audio_norm,
@@ -144,7 +175,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 )
             spec = torch.squeeze(spec, 0)
             if self.spec_cache:
-                torch.save(spec, spec_filename)
+                torch.save({"spec": spec, "stft_params": stft_params}, spec_filename)
         return spec, audio_norm
 
     def get_text(self, text, word2ph, phone, tone, language_str, wav_path):
@@ -303,11 +334,19 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
     def _create_buckets(self):
         buckets = [[] for _ in range(len(self.boundaries) - 1)]
+        dropped = 0
         for i in range(len(self.lengths)):
             length = self.lengths[i]
             idx_bucket = self._bisect(length)
-            if idx_bucket != -1:
+            if idx_bucket == -1:
+                # 境界 [min, max] 外のサンプルは黙って破棄される（前処理の check_dataset で先に気づける）
+                dropped += 1
+            else:
                 buckets[idx_bucket].append(i)
+        if dropped > 0:
+            logger.warning(
+                f"{dropped} samples are outside the bucket boundaries {self.boundaries[:1]}..{self.boundaries[-1:]} and will NOT be used for training."
+            )
 
         try:
             for i in range(len(buckets) - 1, 0, -1):
