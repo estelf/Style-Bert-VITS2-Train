@@ -24,8 +24,9 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
         loss += r_loss + g_loss
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        # generator_loss と同様テンソルのまま返す（毎ステップの GPU 同期を防ぐ。使うのはログ出力時だけ）
+        r_losses.append(r_loss.detach())
+        g_losses.append(g_loss.detach())
 
     return loss, r_losses, g_losses
 
@@ -35,9 +36,9 @@ def generator_loss(disc_outputs):
     gen_losses = []
     for dg in disc_outputs:
         dg = dg.float()
-        l = torch.mean((1 - dg) ** 2)
-        gen_losses.append(l)
-        loss += l
+        gen_loss = torch.mean((1 - dg) ** 2)
+        gen_losses.append(gen_loss)
+        loss += gen_loss
 
     return loss, gen_losses
 
@@ -56,13 +57,13 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     kl = logs_p - logs_q - 0.5
     kl += 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2.0 * logs_p)
     kl = torch.sum(kl * z_mask)
-    l = kl / torch.sum(z_mask)
-    return l
+    loss = kl / torch.sum(z_mask)
+    return loss
 
 
 class WavLMLoss(torch.nn.Module):
     def __init__(self, model, wd, model_sr, slm_sr=16000):
-        super(WavLMLoss, self).__init__()
+        super().__init__()
         self.wavlm = AutoModel.from_pretrained(model)
         self.wd = wd
         self.resample = torchaudio.transforms.Resample(model_sr, slm_sr)

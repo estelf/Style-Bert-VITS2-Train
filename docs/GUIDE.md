@@ -116,7 +116,7 @@ model = TTSModel(
     config_path=p / "config.json",
     style_vec_path=p / "style_vectors.npy",
     device="cuda",  # CPU でも可
-    dtype="float16",  # 推論時の重みの精度。既定（フル半精度推論でVRAM節約）。全精度なら "float32"。学習時の既定は float32（`preprocess_all.py --dtype`、fp16学習は不可のため選択不可）
+    dtype="float16",  # 推論時の重みの精度。既定（フル半精度推論でVRAM節約）。全精度なら "float32"。学習は常に float32（bf16/fp16 学習経路は廃止済み）
 )
 sr, audio = model.infer(text="こんにちは", speaker_id=0, style="Neutral")
 ```

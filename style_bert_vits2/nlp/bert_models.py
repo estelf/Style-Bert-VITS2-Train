@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import gc
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from transformers import (
     AutoModelForMaskedLM,
@@ -25,28 +25,23 @@ from transformers import (
 from style_bert_vits2.constants import DEFAULT_BERT_MODEL_PATH
 from style_bert_vits2.logging import logger
 
-
 if TYPE_CHECKING:
     import torch
 
 
 # ロード済みの日本語 BERT モデル
-__loaded_model: Optional[PreTrainedModel] = None
+__loaded_model: PreTrainedModel | None = None
 
 # ロード済みの日本語 BERT トークナイザー
-__loaded_tokenizer: Optional[
-    "PreTrainedTokenizer | PreTrainedTokenizerFast"
-] = None
+__loaded_tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast | None = None
 
 
 def load_model(
-    pretrained_model_name_or_path: Optional[str] = None,
-    device_map: Optional[
-        "str | dict[str, int | torch.device] | int | torch.device"
-    ] = None,
-    cache_dir: Optional[str] = None,
+    pretrained_model_name_or_path: str | None = None,
+    device_map: str | dict[str, int | torch.device] | int | torch.device | None = None,
+    cache_dir: str | None = None,
     revision: str = "main",
-) -> "PreTrainedModel":
+) -> PreTrainedModel:
     """
     日本語 BERT モデルをロードし、ロード済みの BERT モデルを返す。
     一度ロードされていれば、ロード済みの BERT モデルを即座に返す。
@@ -75,9 +70,9 @@ def load_model(
 
     # pretrained_model_name_or_path が指定されていない場合はデフォルトのパスを利用
     if pretrained_model_name_or_path is None:
-        assert DEFAULT_BERT_MODEL_PATH.exists(), (
-            "The default JP BERT model does not exist on the file system. Please specify the path to the pre-trained model."
-        )
+        assert (
+            DEFAULT_BERT_MODEL_PATH.exists()
+        ), "The default JP BERT model does not exist on the file system. Please specify the path to the pre-trained model."
         pretrained_model_name_or_path = str(DEFAULT_BERT_MODEL_PATH)
 
     # BERT モデルをロードし、格納して返す
@@ -101,10 +96,10 @@ def load_model(
 
 
 def load_tokenizer(
-    pretrained_model_name_or_path: Optional[str] = None,
-    cache_dir: Optional[str] = None,
+    pretrained_model_name_or_path: str | None = None,
+    cache_dir: str | None = None,
     revision: str = "main",
-) -> "PreTrainedTokenizer | PreTrainedTokenizerFast":
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """
     日本語 BERT トークナイザーをロードし、ロード済みの BERT トークナイザーを返す。
     一度ロードされていれば、ロード済みの BERT トークナイザーを即座に返す。
@@ -128,9 +123,9 @@ def load_tokenizer(
 
     # pretrained_model_name_or_path が指定されていない場合はデフォルトのパスを利用
     if pretrained_model_name_or_path is None:
-        assert DEFAULT_BERT_MODEL_PATH.exists(), (
-            "The default JP BERT tokenizer does not exist on the file system. Please specify the path to the pre-trained model."
-        )
+        assert (
+            DEFAULT_BERT_MODEL_PATH.exists()
+        ), "The default JP BERT tokenizer does not exist on the file system. Please specify the path to the pre-trained model."
         pretrained_model_name_or_path = str(DEFAULT_BERT_MODEL_PATH)
 
     # BERT トークナイザーをロードし、格納して返す
@@ -140,9 +135,7 @@ def load_tokenizer(
         revision=revision,
         use_fast=True,  # デフォルトで True だが念のため明示的に指定
     )
-    logger.info(
-        f"Loaded the JP BERT tokenizer from {pretrained_model_name_or_path}"
-    )
+    logger.info(f"Loaded the JP BERT tokenizer from {pretrained_model_name_or_path}")
 
     return __loaded_tokenizer
 
@@ -168,9 +161,7 @@ def transfer_model(device: str) -> None:
         return
 
     __loaded_model.to(device)  # type: ignore
-    logger.info(
-        f"Transferred the JP BERT model from {current_device} to {device}"
-    )
+    logger.info(f"Transferred the JP BERT model from {current_device} to {device}")
 
 
 def is_model_loaded() -> bool:

@@ -1,32 +1,37 @@
+import os
 import random
 import sys
 from functools import cache
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
-from pathlib import Path
 import torch.utils.data
 from tqdm import tqdm
 
-from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons
 from style_bert_vits2.models.hyper_parameters import HyperParametersData
 from style_bert_vits2.models.utils import load_filepaths_and_text, load_wav_to_torch
 from style_bert_vits2.nlp import cleaned_text_to_sequence
+from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 
 """Multi speaker version"""
 
 
 @cache
-def _spec_length(audiopath: str, hop_length: int) -> int:
+def _spec_length(
+    audiopath: str, filter_length: int, hop_length: int, win_length: int
+) -> int:
     """
     バケット分け用の音声長（スペクトラムフレーム数）を実測値から求める。
     ファイルサイズからの推定（16bit PCM WAV前提）と違い FLAC でも正確な実フレーム数ベース。
-    ヘッダのみ読むため高速で、結果はパス単位でキャッシュされる。
+    ヘッダのみ読むため高速で、結果はパス単位でキャッシュされる。center=False の STFT が実際に
+    出力するフレーム数を再現する（両側に int((filter_length - hop_length) / 2) の reflect パディング）。
     """
-    return sf.info(audiopath).frames // hop_length
+    pad = 2 * int((filter_length - hop_length) / 2)
+    return (sf.info(audiopath).frames + pad - win_length) // hop_length + 1
 
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
@@ -74,8 +79,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         Filter text & store spec lengths
         """
         # Store spectrogram lengths for Bucketing
-        # 実フレーム数（WAV/FLAC 問わず soundfile のヘッダから取得）からバケット用長を算出
-        # spec_length = frames // hop_length
+        # 実フレーム数ベースの厳密な出力フレーム数は _spec_length() 側で算出（コメント参照）
 
         audiopaths_sid_text_new = []
         lengths = []
@@ -92,7 +96,12 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             audiopaths_sid_text_new.append(
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
-            lengths.append(_spec_length(audiopath, self.hop_length))
+            # ヘッダ情報から正確なサンプル数を読み、center=False の STFT 出力フレーム数を再現する
+            lengths.append(
+                _spec_length(
+                    audiopath, self.filter_length, self.hop_length, self.win_length
+                )
+            )
             # else:
             #     skipped += 1
         logger.info(
@@ -129,9 +138,32 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         spec_filename = str(Path(filename).with_suffix(".spec.pt"))
         if self.use_mel_spec_posterior:
             spec_filename = spec_filename.replace(".spec.pt", ".mel.pt")
-        try:
-            spec = torch.load(spec_filename, weights_only=True)
-        except:
+        # キャッシュキーに STFT 設定を持たせ、filter_length/hop_length/win_length/sampling_rate を
+        # 変えたときに古いスペクトログラムで学習が進まないようにする（旧形式や不一致なら作り直す）
+        stft_params = {
+            "filter_length": self.filter_length,
+            "hop_length": self.hop_length,
+            "win_length": self.win_length,
+            "sampling_rate": self.sampling_rate,
+            "use_mel_spec_posterior": self.use_mel_spec_posterior,
+            "n_mel_channels": (
+                self.n_mel_channels if self.use_mel_spec_posterior else None
+            ),
+            "mel_fmin": self.hparams.mel_fmin if self.use_mel_spec_posterior else None,
+            "mel_fmax": self.hparams.mel_fmax if self.use_mel_spec_posterior else None,
+        }
+        spec = None
+        if os.path.exists(spec_filename):
+            try:
+                cached = torch.load(spec_filename, weights_only=True)
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("stft_params") == stft_params
+                ):
+                    spec = cached["spec"]
+            except Exception:
+                pass  # 旧形式（生のテンソルのみ）や読み込み失敗は再計算対象
+        if spec is None:
             if self.use_mel_spec_posterior:
                 spec = mel_spectrogram_torch(
                     audio_norm,
@@ -155,7 +187,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 )
             spec = torch.squeeze(spec, 0)
             if self.spec_cache:
-                torch.save(spec, spec_filename)
+                torch.save({"spec": spec, "stft_params": stft_params}, spec_filename)
         return spec, audio_norm
 
     def get_text(self, text, word2ph, phone, tone, language_str, wav_path):
@@ -314,11 +346,19 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
     def _create_buckets(self):
         buckets = [[] for _ in range(len(self.boundaries) - 1)]
+        dropped = 0
         for i in range(len(self.lengths)):
             length = self.lengths[i]
             idx_bucket = self._bisect(length)
-            if idx_bucket != -1:
+            if idx_bucket == -1:
+                # 境界 [min, max] 外のサンプルは黙って破棄される（前処理の check_dataset で先に気づける）
+                dropped += 1
+            else:
                 buckets[idx_bucket].append(i)
+        if dropped > 0:
+            logger.warning(
+                f"{dropped} samples are outside the bucket boundaries {self.boundaries[:1]}..{self.boundaries[-1:]} and will NOT be used for training."
+            )
 
         try:
             for i in range(len(buckets) - 1, 0, -1):

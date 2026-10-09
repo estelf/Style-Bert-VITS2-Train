@@ -1,32 +1,37 @@
 import argparse
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from pyannote.audio import Inference, Model
 from tqdm import tqdm
 
 from style_bert_vits2.constants import DATASET_ROOT
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
-from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
-
-
-model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM")
-inference = Inference(model, window="whole")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-inference.to(device)
 
 
 class NaNValueError(ValueError):
     """カスタム例外クラス。NaN値が見つかった場合に使用されます。"""
 
 
+@lru_cache(maxsize=1)
+def _get_inference():
+    """pyannote モデルは重量級でダウンロードも走るため、実際にスタイル生成が必要になるまで遅延ロードする（--help だけで落ちない）"""
+    from pyannote.audio import Inference, Model
+
+    model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM")
+    inference = Inference(model, window="whole")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return inference.to(device)
+
+
 # 推論時にインポートするために短いが関数を書く
 def get_style_vector(wav_path: str) -> NDArray[Any]:
-    return inference(wav_path)  # type: ignore
+    return _get_inference()(wav_path)  # type: ignore
 
 
 def save_style_vector(wav_path: str):
@@ -55,9 +60,7 @@ def process_line(line: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model_name", "-m", type=str, required=True, help="モデル名"
-    )
+    parser.add_argument("--model_name", "-m", type=str, required=True, help="モデル名")
     parser.add_argument("--num_processes", type=int, default=4)
     args, _ = parser.parse_known_args()
     config_path = str(DATASET_ROOT / args.model_name / "config.json")
@@ -73,7 +76,7 @@ if __name__ == "__main__":
             tqdm(
                 executor.map(process_line, training_lines),
                 total=len(training_lines),
-                file=SAFE_STDOUT,
+                file=sys.stdout,
                 dynamic_ncols=True,
             )
         )
@@ -96,7 +99,7 @@ if __name__ == "__main__":
             tqdm(
                 executor.map(process_line, val_lines),
                 total=len(val_lines),
-                file=SAFE_STDOUT,
+                file=sys.stdout,
                 dynamic_ncols=True,
             )
         )

@@ -16,7 +16,9 @@ class WorkerClient:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # timeout: seconds
         sock.settimeout(timeout)
-        sock.connect(("localhost", port))  # WSL2 mirrored network 等を考慮し、hostname でなく明示的に localhost を使う
+        sock.connect(
+            ("localhost", port)
+        )  # WSL2 mirrored network 等を考慮し、hostname でなく明示的に localhost を使う
         self.sock = sock
 
     def __enter__(self) -> "WorkerClient":

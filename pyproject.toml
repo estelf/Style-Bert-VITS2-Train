@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "style-bert-vits2"
-# uv_build は動的バージョン非対応のため静的指定（style_bert_vits2/constants.py の VERSION と必ず揃える）
+# uv_build は動的バージョン非対応のため静的指定（constants.py の VERSION は importlib.metadata 経由でここを読む）
 version = "2.7.0"
 description = "Style-Bert-VITS2: Bert-VITS2 with more controllable voice styles. (Japanese-only learning core)"
 readme = "README.md"
@@ -26,17 +26,17 @@ classifiers = [
 ]
 dependencies = [
     "accelerate",
-    "gradio>=5.0",
+    "huggingface-hub",  # train/initialize.py の事前学習モデル取得（hf_hub_download）に必要
     "librosa",
     "loguru",
     "numba",
     "num2words",
-    "numpy>=2",  # pyannote.audio 4.x が numpy>=2 を要求する。pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が提供されるためソースビルド不要
-    "pyannote.audio>=4.0.7",
+    "numpy>=2",  # pyannote.audio 4.x（train エクストラ）が numpy>=2 を要求する。pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が提供されるためソースビルド不要
     "pydantic>=2.0",
     "pyopenjtalk-plus[onnxruntime,tsqyomi]",  # pyopenjtalk のドロップイン代替（import pyopenjtalk のまま）。onnxruntime は「何」読み推定用、tsqyomi は同形異音語の文脈読み選択用
     "pyworld-prebuilt",
     "safetensors",
+    "soundfile",  # check_dataset.py / data_utils.py の音声読み込み
     "tensorboard",
     "torch>=2.4",
     "torchaudio>=2.4",
@@ -45,8 +45,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 学習ログ用プロット（spectrogram/alignment の画像変換: style_bert_vits2/models/utils/__init__.py）用
-style-vectors = [
+# 試聴 GUI（app.py / gradio_tabs）専用。コアライブラリ・学習パイプラインには不要
+gui = [
+    "gradio>=5.0",
+]
+# 学習・前処理チェーン専用（スタイル生成の pyannote.audio。numpy>=2 を要求されるため環境に注意）
+train = [
+    "pyannote.audio>=4.0.7",
+]
+# 学習ログのプロット表示用（style_bert_vits2.models.utils の spectrogram/alignment プロット）
+plot = [
     "matplotlib",
 ]
 
@@ -61,7 +69,7 @@ module-name = "style_bert_vits2"
 module-root = ""
 # ソース配布物に含める追加ファイル（コアライブラリ本体以外のリポジトリ資産。LICENSE 等はデフォルトで含まれる）
 source-include = [
-    ".vscode/**",
+    "configs/**",
     "dict_data/default.csv",
     "docs/**",
     "tests/**",
@@ -76,8 +84,10 @@ source-include = [
 
 [dependency-groups]
 dev = [
+    "black",
     "coverage[toml]>=6.5",
     "pytest",
+    "ruff",
     "scipy",
 ]
 
@@ -98,8 +108,8 @@ tests = ["tests", "*/style-bert-vits2/tests"]
 [tool.coverage.report]
 exclude_lines = ["no cov", "if __name__ == .__main__.:", "if TYPE_CHECKING:"]
 
-[tool.ruff]
-extend-select = ["I"]
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2

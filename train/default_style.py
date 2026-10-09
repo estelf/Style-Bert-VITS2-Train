@@ -6,8 +6,8 @@ Neutral だけでも十分高い精度が出るため、サブディレクトリ
 
 import json
 from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence, Union
 
 import numpy as np
 
@@ -16,7 +16,7 @@ from style_bert_vits2.logging import logger
 
 
 def load_utterance_vectors(
-    list_paths: Sequence[Union[Path, str]], wav_dir: Union[Path, str]
+    list_paths: Sequence[Path | str], wav_dir: Path | str
 ) -> dict[str, list[np.ndarray]]:
     """train.list / val.list の行から、実際に学習へ投入された発話のスタイル特徴を読み込む。
 
@@ -45,7 +45,9 @@ def load_utterance_vectors(
     return groups
 
 
-def trimmed_mean(vectors: Sequence[np.ndarray], threshold: float = 3.0, max_iter: int = 5) -> np.ndarray:
+def trimmed_mean(
+    vectors: Sequence[np.ndarray], threshold: float = 3.0, max_iter: int = 5
+) -> np.ndarray:
     """MAD（中央値絶対偏差）基準の反復トリム平均で代表ベクトルを算出する。
 
     1. 現在の中央ベクトルからの距離を各発話について計算
@@ -73,11 +75,11 @@ def trimmed_mean(vectors: Sequence[np.ndarray], threshold: float = 3.0, max_iter
 
 
 def save_neutral_vector(
-    list_paths: Sequence[Union[Path, str]],
-    wav_dir: Union[Path, str],
-    output_dir: Union[Path, str],
-    config_path: Union[Path, str],
-    config_output_path: Union[Path, str],
+    list_paths: Sequence[Path | str],
+    wav_dir: Path | str,
+    output_dir: Path | str,
+    config_path: Path | str,
+    config_output_path: Path | str,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -100,11 +102,11 @@ def save_neutral_vector(
 
 
 def save_styles_by_dirs(
-    list_paths: Sequence[Union[Path, str]],
-    wav_dir: Union[Path, str],
-    output_dir: Union[Path, str],
-    config_path: Union[Path, str],
-    config_output_path: Union[Path, str],
+    list_paths: Sequence[Path | str],
+    wav_dir: Path | str,
+    output_dir: Path | str,
+    config_path: Path | str,
+    config_output_path: Path | str,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -120,9 +122,7 @@ def save_styles_by_dirs(
         return
 
     # まず全発話のトリム平均で Neutral を作る（元の順序を保持して全グループ対象）
-    style_vectors = [
-        trimmed_mean([vec for vecs in groups.values() for vec in vecs])
-    ]
+    style_vectors = [trimmed_mean([vec for vecs in groups.values() for vec in vecs])]
     names = [DEFAULT_STYLE]
     for name in style_dirs:
         style_vectors.append(trimmed_mean(groups[name]))
@@ -145,11 +145,11 @@ def save_styles_by_dirs(
 
 
 def save_style_vectors(
-    list_paths: Sequence[Union[Path, str]],
-    wav_dir: Union[Path, str],
-    output_dir: Union[Path, str],
-    config_path: Union[Path, str],
-    config_output_path: Union[Path, str],
+    list_paths: Sequence[Path | str],
+    wav_dir: Path | str,
+    output_dir: Path | str,
+    config_path: Path | str,
+    config_output_path: Path | str,
     styles_by_dirs: bool = False,
 ):
     """スタイルベクトルを生成して config.json に style2id を書き込む。

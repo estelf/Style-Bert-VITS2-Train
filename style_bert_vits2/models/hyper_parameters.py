@@ -5,7 +5,6 @@ Style-Bert-VITS2 モデルのハイパーパラメータを表す Pydantic モ�
 """
 
 from pathlib import Path
-from typing import Optional, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,8 +18,9 @@ class HyperParametersTrain(BaseModel):
     betas: tuple[float, float] = (0.8, 0.99)
     eps: float = 1e-9
     batch_size: int = 2
-    dtype: str = "float32"  # 学習時の計算精度 ("float32" / "bfloat16")。既定 float32（upstream 既定に合わせ。allow_tf32/TF32 が有効なため bf16 の速度メリットが無いに等しい）。fp16 は動的範囲が足りず（アテンションスコアが溢れ全ステップスキップになる）ため非対応
-    lr_decay: float = 0.99996
+    lr_decay: float = (
+        0.99996  # エポック単位で係数を適用する（既定値だと100エポックで約0.4%しか減衰せず実質定数LR）
+    )
     segment_size: int = 16384
     init_lr_ratio: int = 1
     warmup_epochs: int = 0
@@ -46,7 +46,7 @@ class HyperParametersData(BaseModel):
     win_length: int = 2048
     n_mel_channels: int = 128
     mel_fmin: float = 0.0
-    mel_fmax: Optional[float] = None
+    mel_fmax: float | None = None
     add_blank: bool = True
     n_speakers: int = 1
     cleaned_text: bool = True
@@ -104,17 +104,16 @@ class HyperParameters(BaseModel):
     model: HyperParametersModel = HyperParametersModel()
 
     # 以下は学習時にのみ動的に設定されるパラメータ (通常 config.json には存在しない)
-    model_dir: Optional[str] = None
-    out_dir: Optional[str] = None
-    dataset_path: Optional[str] = None
+    model_dir: str | None = None
+    out_dir: str | None = None
+    dataset_path: str | None = None
     speedup: bool = False
-    repo_id: Optional[str] = None
 
     # model_ 以下を Pydantic の保護対象から除外する
     model_config = ConfigDict(protected_namespaces=())
 
     @staticmethod
-    def load_from_json(json_path: Union[str, Path]) -> "HyperParameters":
+    def load_from_json(json_path: str | Path) -> "HyperParameters":
         """
         与えられた JSON ファイルからハイパーパラメータを読み込む。
 

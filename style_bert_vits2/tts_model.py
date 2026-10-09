@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,7 +23,6 @@ from style_bert_vits2.constants import (
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.voice import adjust_voice
-
 
 if TYPE_CHECKING:
     from style_bert_vits2.models.models_jp_extra import SynthesizerTrn
@@ -52,8 +51,8 @@ class TTSModel:
     def __init__(
         self,
         model_path: Path,
-        config_path: Union[Path, HyperParameters],
-        style_vec_path: Union[Path, NDArray[Any]],
+        config_path: Path | HyperParameters,
+        style_vec_path: Path | NDArray[Any],
         device: str = "cpu",
         dtype: str = "float16",
     ) -> None:
@@ -113,11 +112,11 @@ class TTSModel:
             raise ValueError(
                 f"The number of styles ({num_styles}) does not match the number of style vectors ({self.style_vectors.shape[0]})"
             )
-        self.style_vector_inference: Optional[Any] = None
+        self.style_vector_inference: Any | None = None
 
         # net_g / null_model_params は遅延初期化される
-        self.net_g: Optional[SynthesizerTrn] = None
-        self.null_model_params: Optional[dict[int, NullModelParam]] = None
+        self.net_g: SynthesizerTrn | None = None
+        self.null_model_params: dict[int, NullModelParam] | None = None
 
     def load(self) -> None:
         """
@@ -157,14 +156,10 @@ class TTSModel:
                 dtype=getattr(torch, self.dtype),
             )
             # 愚直。もっと上手い方法ありそう
-            params = zip(
-                self.net_g.dec.parameters(), null_model_add.dec.parameters()
-            )
+            params = zip(self.net_g.dec.parameters(), null_model_add.dec.parameters())
             for v in params:
                 v[0].data.add_(v[1].data, alpha=float(null_model_info.weight))
-            params = zip(
-                self.net_g.flow.parameters(), null_model_add.flow.parameters()
-            )
+            params = zip(self.net_g.flow.parameters(), null_model_add.flow.parameters())
             for v in params:
                 v[0].data.add_(v[1].data, alpha=float(null_model_info.pitch))
 
@@ -174,9 +169,7 @@ class TTSModel:
             for v in params:
                 v[0].data.add_(v[1].data, alpha=float(null_model_info.style))
             # テンポは sdp と dp 二つあるからとりあえずどっちも足す
-            params = zip(
-                self.net_g.sdp.parameters(), null_model_add.sdp.parameters()
-            )
+            params = zip(self.net_g.sdp.parameters(), null_model_add.sdp.parameters())
             for v in params:
                 v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
             params = zip(self.net_g.dp.parameters(), null_model_add.dp.parameters())
@@ -309,23 +302,23 @@ class TTSModel:
         self,
         text: str,
         speaker_id: int = 0,
-        reference_audio_path: Optional[str] = None,
+        reference_audio_path: str | None = None,
         sdp_ratio: float = DEFAULT_SDP_RATIO,
         noise: float = DEFAULT_NOISE,
         noise_w: float = DEFAULT_NOISEW,
         length: float = DEFAULT_LENGTH,
         line_split: bool = DEFAULT_LINE_SPLIT,
         split_interval: float = DEFAULT_SPLIT_INTERVAL,
-        assist_text: Optional[str] = None,
+        assist_text: str | None = None,
         assist_text_weight: float = DEFAULT_ASSIST_TEXT_WEIGHT,
         use_assist_text: bool = False,
         style: str = DEFAULT_STYLE,
         style_weight: float = DEFAULT_STYLE_WEIGHT,
-        given_phone: Optional[list[str]] = None,
-        given_tone: Optional[list[int]] = None,
+        given_phone: list[str] | None = None,
+        given_tone: list[int] | None = None,
         pitch_scale: float = 1.0,
         intonation_scale: float = 1.0,
-        null_model_params: Optional[dict[int, NullModelParam]] = None,
+        null_model_params: dict[int, NullModelParam] | None = None,
         force_reload_model: bool = False,
     ) -> tuple[int, NDArray[Any]]:
         """
@@ -497,7 +490,7 @@ class TTSModelHolder:
         self.device: str = device
         self.dtype: str = dtype
         self.model_files_dict: dict[str, list[Path]] = {}
-        self.current_model: Optional[TTSModel] = None
+        self.current_model: TTSModel | None = None
         self.model_names: list[str] = []
         self.models_info: list[TTSModelInfo] = []
         self.refresh()
@@ -583,7 +576,7 @@ class TTSModelHolder:
         return self.current_model
 
     def get_model_for_gradio(
-        self, model_name: str, model_path_str: str, dtype: Optional[str] = None
+        self, model_name: str, model_path_str: str, dtype: str | None = None
     ):
         """GUI からモデルを取得する。dtype を指定した場合（float32/float16）はロード時に適用される。"""
         import gradio as gr

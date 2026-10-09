@@ -3,12 +3,11 @@ import datetime
 import gc
 import os
 import platform
+import sys
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from huggingface_hub import HfApi
-from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -18,6 +17,16 @@ from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
 
 # logging.getLogger("numba").setLevel(logging.WARNING)
 from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT, TRAIN_ENV_DEFAULTS
+from style_bert_vits2.logging import logger
+from style_bert_vits2.models import commons, utils
+from style_bert_vits2.models.hyper_parameters import HyperParameters
+from style_bert_vits2.models.models_jp_extra import (
+    DurationDiscriminator,
+    MultiPeriodDiscriminator,
+    SynthesizerTrn,
+    WavLMDiscriminator,
+)
+from style_bert_vits2.nlp.symbols import SYMBOLS
 from train import default_style
 from train.data_utils import (
     DistributedBucketSampler,
@@ -32,18 +41,6 @@ from train.losses import (
     kl_loss,
 )
 from train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
-from style_bert_vits2.logging import logger
-from style_bert_vits2.models import commons, utils
-from style_bert_vits2.models.hyper_parameters import HyperParameters
-from style_bert_vits2.models.models_jp_extra import (
-    DurationDiscriminator,
-    MultiPeriodDiscriminator,
-    SynthesizerTrn,
-    WavLMDiscriminator,
-)
-from style_bert_vits2.nlp.symbols import SYMBOLS
-from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
-
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
@@ -51,14 +48,18 @@ torch.backends.cudnn.allow_tf32 = (
 )
 torch.set_num_threads(1)
 torch.set_float32_matmul_precision("medium")
+# torch.backends.cuda.sdp_kernel("flash") は deprecated（sdp_kernel 自体が廃止予定）。下 enable_* で同等の設定を明示する
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(
     True
 )  # Not available if torch version is lower than 2.0
 
-global_step = 0
+# GPU 学習は本質的にビット単位の非決定性（conv backward のアトミック加算等）があるが、
+# 回帰テストでゴールデン音声と決定論的に比較できるよう全面決定論化する。
+# CUBLAS_WORKSPACE_CONFIG は cuBLAS ハンドル生成時に読まれるため、CUDA 呼び出しより前のモジュール先頭で設定する。
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-api = HfApi()
+global_step = 0
 
 
 def run():
@@ -82,21 +83,9 @@ def run():
         help="Speed up training by disabling logging and evaluation.",
     )
     parser.add_argument(
-        "--repo_id",
-        help="Huggingface model repo id to backup the model.",
-        default=None,
-    )
-    parser.add_argument(
         "--not_use_custom_batch_sampler",
         help="Don't use custom batch sampler for training, which was used in the version < 2.5",
         action="store_true",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        choices=["float32", "bfloat16"],
-        default=None,
-        help="学習時の計算精度。未指定なら config.json の train.dtype（既定 float32）を使う。fp16 は動的範囲不足で学習不可のため選択不可",
     )
     parser.add_argument(
         "--styles_by_dirs",
@@ -150,34 +139,7 @@ def run():
     hps.model_dir = model_dir
     hps.out_dir = out_dir
     hps.dataset_path = dataset_path
-    if args.dtype is not None:  # CLI から明示指定した場合は config.json より優先
-        hps.train.dtype = args.dtype
     hps.speedup = args.speedup
-    hps.repo_id = args.repo_id
-
-    if args.repo_id is not None:
-        # First try to upload config.json to check if the repo exists
-        try:
-            api.upload_file(
-                path_or_fileobj=config_path,
-                path_in_repo=f"Data/{model_name}/config.json",
-                repo_id=hps.repo_id,
-            )
-        except Exception as e:
-            logger.error(e)
-            logger.error(
-                f"Failed to upload files to the repo {hps.repo_id}. Please check if the repo exists and you have logged in using `huggingface-cli login`."
-            )
-            raise e
-        # Upload Data dir for resuming training
-        api.upload_folder(
-            repo_id=hps.repo_id,
-            folder_path=dataset_path,
-            path_in_repo=f"Data/{model_name}",
-            delete_patterns="*.pth",  # Only keep the latest checkpoint
-            ignore_patterns=f"{dataset_path}/raw",  # Ignore raw data
-            run_as_future=True,
-        )
     os.makedirs(out_dir, exist_ok=True)
 
     # 再開時は推論資産（config.json + style_vectors.npy）が既に揃っているのでスタイル生成は自動でスキップする（CLI指定不要）
@@ -199,6 +161,8 @@ def run():
         )
 
     torch.manual_seed(hps.train.seed)
+    # シード固定だけでは消せない演算カーネルレベルの非決定性を潰す（回帰テストのゴールデン比較の前提）
+    torch.use_deterministic_algorithms(True)
     torch.cuda.set_device(local_rank)
 
     global global_step
@@ -260,6 +224,8 @@ def run():
             # これもメモリ消費量を減らそうとしてコメントアウト
             # prefetch_factor=6,
         )
+        # この経路は長さによる除外をしないため、32フレーム未満の音声だと commons.slice_segments の
+        # torch.gather がインデックス範囲外になる。前処理 Step 3（check_dataset）で尺の範囲を検証している
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
         logger.debug(f"len(train_loader): {len(train_loader)}")
@@ -424,10 +390,13 @@ def run():
                 )
                 if not optim_dur_disc.param_groups[0].get("initial_lr"):
                     optim_dur_disc.param_groups[0]["initial_lr"] = dur_resume_lr
-            except:
+            except Exception as e:
+                # 再開失敗時はまだ dur_resume_lr が束縛されていないので参照しない（本当の例外を隠さない）
                 if not optim_dur_disc.param_groups[0].get("initial_lr"):
-                    optim_dur_disc.param_groups[0]["initial_lr"] = dur_resume_lr
-                print("Initialize dur_disc")
+                    optim_dur_disc.param_groups[0][
+                        "initial_lr"
+                    ] = hps.train.learning_rate
+                logger.warning(f"Initialize dur_disc: {e}")
         if net_wd is not None:
             try:
                 _, optim_wd, wd_resume_lr, epoch_str = (
@@ -442,10 +411,11 @@ def run():
                 )
                 if not optim_wd.param_groups[0].get("initial_lr"):
                     optim_wd.param_groups[0]["initial_lr"] = wd_resume_lr
-            except:
+            except Exception as e:
+                # 再開失敗時はまだ wd_resume_lr が束縛されていないので参照しない（本当の例外を隠さない）
                 if not optim_wd.param_groups[0].get("initial_lr"):
-                    optim_wd.param_groups[0]["initial_lr"] = wd_resume_lr
-                logger.info("Initialize wavlm")
+                    optim_wd.param_groups[0]["initial_lr"] = hps.train.learning_rate
+                logger.warning(f"Initialize wavlm: {e}")
 
         try:
             _, optim_g, g_resume_lr, epoch_str = utils.checkpoints.load_checkpoint(
@@ -510,12 +480,13 @@ def run():
 
     def lr_lambda(epoch):
         """
-        Learning rate scheduler for warmup and exponential decay.
-        - During the warmup period, the learning rate increases linearly.
-        - After the warmup period, the learning rate decreases exponentially.
+        Learning rate scheduler for warmup and (near-)constant LR.
+        - During the warmup period, the learning rate increases linearly (epoch は 0 ベースなので +1 する。さないと初回エポックの LR が厳密に 0 になる).
+        - After the warmup period, an epoch-unit factor of lr_decay**epochs is applied. With the default 0.99996 it decays only ~0.4% over 100 epochs,
+          i.e. effectively a constant LR (上流のステップ単位減衰とは異なる点に注意).
         """
         if epoch < hps.train.warmup_epochs:
-            return float(epoch) / float(max(1, hps.train.warmup_epochs))
+            return float(epoch + 1) / float(max(1, hps.train.warmup_epochs))
         else:
             return hps.train.lr_decay ** (epoch - hps.train.warmup_epochs)
 
@@ -545,26 +516,26 @@ def run():
     else:
         scheduler_wd = None
         wl = None
-    scaler = GradScaler(
-        "cuda", enabled=False
-    )  # fp16学習は非対応のため常に無効（スルーパスとして動作）
     logger.info("Start training.")
 
     diff = abs(
         epoch_str * len(train_loader) - (hps.train.epochs + 1) * len(train_loader)
     )
+    # 進捗バーは rank 0 のみ（他ランクで同じバーを出しても意味がない）
     pbar = None
-    if not args.no_progress_bar:
+    if rank == 0 and not args.no_progress_bar:
         pbar = tqdm(
             total=global_step + diff,
             initial=global_step,
             smoothing=0.05,
-            file=SAFE_STDOUT,
+            file=sys.stdout,
             dynamic_ncols=True,
         )
     initial_step = global_step
 
     for epoch in range(epoch_str, hps.train.epochs + 1):
+        # エポックごとにバッチ構成・順序を変える（self.epoch は set_epoch で初めて反映される）
+        train_sampler.set_epoch(epoch)
         if rank == 0:
             train_and_evaluate(
                 rank,
@@ -574,7 +545,6 @@ def run():
                 [net_g, net_d, net_dur_disc, net_wd, wl],
                 [optim_g, optim_d, optim_dur_disc, optim_wd],
                 [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
-                scaler,
                 [train_loader, eval_loader],
                 logger,
                 [writer, writer_eval],
@@ -590,7 +560,6 @@ def run():
                 [net_g, net_d, net_dur_disc, net_wd, wl],
                 [optim_g, optim_d, optim_dur_disc, optim_wd],
                 [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
-                scaler,
                 [train_loader, None],
                 None,
                 None,
@@ -648,29 +617,10 @@ def run():
                 ),
                 for_infer=True,
             )
-            if hps.repo_id is not None:
-                future1 = api.upload_folder(
-                    repo_id=hps.repo_id,
-                    folder_path=dataset_path,
-                    path_in_repo=f"Data/{model_name}",
-                    delete_patterns="*.pth",  # Only keep the latest checkpoint
-                    ignore_patterns=f"{dataset_path}/raw",  # Ignore raw data
-                    run_as_future=True,
-                )
-                future2 = api.upload_folder(
-                    repo_id=hps.repo_id,
-                    folder_path=out_dir,
-                    path_in_repo=f"model_assets/{model_name}",
-                    run_as_future=True,
-                )
-                try:
-                    future1.result()
-                    future2.result()
-                except Exception as e:
-                    logger.error(e)
 
     if pbar is not None:
         pbar.close()
+    dist.destroy_process_group()
 
 
 def train_and_evaluate(
@@ -681,11 +631,10 @@ def train_and_evaluate(
     nets,
     optims,
     schedulers,
-    scaler,
     loaders,
     logger,
     writers,
-    pbar: tqdm,
+    pbar: tqdm | None,
     initial_step: int,
 ):
     net_g, net_d, net_dur_disc, net_wd, wl = nets
@@ -695,10 +644,6 @@ def train_and_evaluate(
     if writers is not None:
         writer, writer_eval = writers
 
-    # 学習時の計算精度（config の train.dtype。bfloat16 のとき autocast を有効にする）
-    amp_enabled = hps.train.dtype == "bfloat16"
-
-    # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
 
     net_g.train()
@@ -741,153 +686,141 @@ def train_and_evaluate(
         bert = bert.cuda(local_rank, non_blocking=True)
         style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
-        with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
+        # 勾配ノルムはログ出力ステップ（rank 0 のみ）だけ計算する（clip_grad_value_(..., None) はクリップせず毎回全パラメータを走査するだけ）
+        is_log_step = (
+            rank == 0 and global_step % hps.train.log_interval == 0 and not hps.speedup
+        )
+
+        (
+            y_hat,
+            l_length,
+            attn,
+            ids_slice,
+            x_mask,
+            z_mask,
+            (z, z_p, m_p, logs_p, m_q, logs_q),
+            (hidden_x, logw, logw_),  # , logw_sdp),
+            g,
+        ) = net_g(
+            x,
+            x_lengths,
+            spec,
+            spec_lengths,
+            speakers,
+            tone,
+            language,
+            bert,
+            style_vec,
+        )
+        mel = spec_to_mel_torch(
+            spec,
+            hps.data.filter_length,
+            hps.data.n_mel_channels,
+            hps.data.sampling_rate,
+            hps.data.mel_fmin,
+            hps.data.mel_fmax,
+        )
+        y_mel = commons.slice_segments(
+            mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+        )
+        y_hat_mel = mel_spectrogram_torch(
+            y_hat.squeeze(1).float(),
+            hps.data.filter_length,
+            hps.data.n_mel_channels,
+            hps.data.sampling_rate,
+            hps.data.hop_length,
+            hps.data.win_length,
+            hps.data.mel_fmin,
+            hps.data.mel_fmax,
+        )
+
+        y = commons.slice_segments(
+            y, ids_slice * hps.data.hop_length, hps.train.segment_size
+        )  # slice
+
+        # Discriminator
+        y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+            y_d_hat_r, y_d_hat_g
+        )
+        loss_disc_all = loss_disc
+        if net_dur_disc is not None:
+            y_dur_hat_r, y_dur_hat_g = net_dur_disc(
+                hidden_x.detach(),
+                x_mask.detach(),
+                logw_.detach(),
+                logw.detach(),
+                g.detach(),
+            )
+            # TODO: I think need to mean using the mask, but for now, just mean all
             (
-                y_hat,
-                l_length,
-                attn,
-                ids_slice,
-                x_mask,
-                z_mask,
-                (z, z_p, m_p, logs_p, m_q, logs_q),
-                (hidden_x, logw, logw_),  # , logw_sdp),
-                g,
-            ) = net_g(
-                x,
-                x_lengths,
-                spec,
-                spec_lengths,
-                speakers,
-                tone,
-                language,
-                bert,
-                style_vec,
-            )
-            mel = spec_to_mel_torch(
-                spec,
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
-            y_mel = commons.slice_segments(
-                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
-            )
-            y_hat_mel = mel_spectrogram_torch(
-                y_hat.squeeze(1).float(),
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.hop_length,
-                hps.data.win_length,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
+                loss_dur_disc,
+                losses_dur_disc_r,
+                losses_dur_disc_g,
+            ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
+            loss_dur_disc_all = loss_dur_disc
+            optim_dur_disc.zero_grad()
+            loss_dur_disc_all.backward()
+            # 勾配ノルムはログに出力しないので計算しない（旧実装は毎回全パラメータを走査するだけだった）
+            optim_dur_disc.step()
+        if net_wd is not None:
+            # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
+            # shape: (batch, 1, time)
+            loss_slm = wl.discriminator(
+                y.detach().squeeze(1), y_hat.detach().squeeze(1)
+            ).mean()
 
-            y = commons.slice_segments(
-                y, ids_slice * hps.data.hop_length, hps.train.segment_size
-            )  # slice
-
-            # Discriminator
-            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
-                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                    y_d_hat_r, y_d_hat_g
-                )
-                loss_disc_all = loss_disc
-            if net_dur_disc is not None:
-                y_dur_hat_r, y_dur_hat_g = net_dur_disc(
-                    hidden_x.detach(),
-                    x_mask.detach(),
-                    logw_.detach(),
-                    logw.detach(),
-                    g.detach(),
-                )
-                with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
-                    # TODO: I think need to mean using the mask, but for now, just mean all
-                    (
-                        loss_dur_disc,
-                        losses_dur_disc_r,
-                        losses_dur_disc_g,
-                    ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
-                    loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
-                scaler.scale(loss_dur_disc_all).backward()
-                scaler.unscale_(optim_dur_disc)
-                # torch.nn.utils.clip_grad_norm_(
-                # parameters=net_dur_disc.parameters(), max_norm=5
-                # )
-                grad_norm_dur = commons.clip_grad_value_(
-                    net_dur_disc.parameters(), None
-                )
-                scaler.step(optim_dur_disc)
-            if net_wd is not None:
-                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
-                # shape: (batch, 1, time)
-                with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
-                    loss_slm = wl.discriminator(
-                        y.detach().squeeze(1), y_hat.detach().squeeze(1)
-                    ).mean()
-
-                optim_wd.zero_grad()
-                scaler.scale(loss_slm).backward()
-                scaler.unscale_(optim_wd)
-                # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
+            optim_wd.zero_grad()
+            loss_slm.backward()
+            if is_log_step:
                 grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
-                scaler.step(optim_wd)
+            optim_wd.step()
 
         optim_d.zero_grad()
-        scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        if amp_enabled:
-            torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
+        loss_disc_all.backward()
+        if is_log_step:
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        optim_d.step()
 
-        with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
-            # Generator
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            if net_dur_disc is not None:
-                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+        # Generator
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+        if net_dur_disc is not None:
+            _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+        if net_wd is not None:
+            loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+            loss_lm_gen = wl.generator(y_hat.squeeze(1))
+        loss_dur = torch.sum(l_length.float())
+        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+        loss_fm = feature_loss(fmap_r, fmap_g)
+        loss_gen, losses_gen = generator_loss(y_d_hat_g)
+        # loss_commit = loss_commit * hps.train.c_commit
+
+        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+        if net_dur_disc is not None:
+            loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
             if net_wd is not None:
-                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast("cuda", enabled=amp_enabled, dtype=torch.bfloat16):
-                loss_dur = torch.sum(l_length.float())
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
-                loss_fm = feature_loss(fmap_r, fmap_g)
-                loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                # loss_commit = loss_commit * hps.train.c_commit
-
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-                if net_dur_disc is not None:
-                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                    if net_wd is not None:
-                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                    else:
-                        loss_gen_all += loss_dur_gen
+                loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+            else:
+                loss_gen_all += loss_dur_gen
         optim_g.zero_grad()
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        # if amp_enabled:
-        torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
+        loss_gen_all.backward()
+        # 実際のクリップは毎回必要なので clip_grad_norm_ は残し、その戻り値をログ用にそのまま使う
+        grad_norm_g = torch.nn.utils.clip_grad_norm_(
+            parameters=net_g.parameters(), max_norm=500
+        )
+        optim_g.step()
 
         if rank == 0:
-            if global_step % hps.train.log_interval == 0 and not hps.speedup:
+            if is_log_step:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(
                 #     "Train Epoch: {} [{:.0f}%]".format(
                 #         epoch, 100.0 * batch_idx / len(train_loader)
                 #     )
                 # )
-                # logger.info([x.item() for x in losses] + [global_step, lr])
+                # logger.info([loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl] + [global_step, lr])
 
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,
@@ -1018,21 +951,6 @@ def train_and_evaluate(
                     ),
                     for_infer=True,
                 )
-                if hps.repo_id is not None:
-                    api.upload_folder(
-                        repo_id=hps.repo_id,
-                        folder_path=hps.dataset_path,
-                        path_in_repo=f"Data/{hps.model_name}",
-                        delete_patterns="*.pth",  # Only keep the latest checkpoint
-                        ignore_patterns=f"{hps.dataset_path}/raw",  # Ignore raw data
-                        run_as_future=True,
-                    )
-                    api.upload_folder(
-                        repo_id=hps.repo_id,
-                        folder_path=hps.out_dir,
-                        path_in_repo=f"model_assets/{hps.model_name}",
-                        run_as_future=True,
-                    )
 
         global_step += 1
         if pbar is not None:
@@ -1041,8 +959,8 @@ def train_and_evaluate(
             )
             pbar.update()
 
+    # caching allocator が空きを再利用するため、エポックごとの empty_cache は不要（削除）
     gc.collect()
-    torch.cuda.empty_cache()
     if pbar is None and rank == 0:
         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from style_bert_vits2.constants import Languages
 from style_bert_vits2.nlp.symbols import (
@@ -8,7 +8,6 @@ from style_bert_vits2.nlp.symbols import (
     LANGUAGE_TONE_START_MAP,
     SYMBOLS,
 )
-
 
 # __init__.py は配下のモジュールをインポートした時点で実行される
 # PyTorch のインポートは重いので、型チェック時以外はインポートしない
@@ -23,9 +22,9 @@ def extract_bert_feature(
     text: str,
     word2ph: list[int],
     device: str,
-    assist_text: Optional[str] = None,
+    assist_text: str | None = None,
     assist_text_weight: float = 0.7,
-) -> "torch.Tensor":
+) -> torch.Tensor:
     """
     テキストから BERT の特徴量を抽出する (PyTorch 推論)
 
@@ -71,8 +70,8 @@ def clean_text(
 
 def clean_text_with_given_phone_tone(
     text: str,
-    given_phone: Optional[list[str]] = None,
-    given_tone: Optional[list[int]] = None,
+    given_phone: list[str] | None = None,
+    given_tone: list[int] | None = None,
     raise_yomi_error: bool = False,
 ) -> tuple[str, list[str], list[int], list[int]]:
     """

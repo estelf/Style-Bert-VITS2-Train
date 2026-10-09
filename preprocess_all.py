@@ -29,7 +29,7 @@ if __name__ == "__main__":
         default=cpu_count() // 2,
     )
     parser.add_argument(
-        "--freeze_JP_bert", action="store_true", help="Freeze JP BERT", default=True
+        "--freeze_JP_bert", action="store_true", help="Freeze JP BERT", default=False
     )
     parser.add_argument(
         "--freeze_style", action="store_true", help="Freeze style vector", default=False
@@ -56,11 +56,10 @@ if __name__ == "__main__":
         default="raise",
     )
     parser.add_argument(
-        "--dtype",
-        type=str,
-        choices=["float32", "bfloat16"],
-        help="学習時の計算精度（config.json の train.dtype に書き込まれる。既定 float32。fp16 は学習に使えないため選択不可）",
-        default="float32",
+        "--reset_models",
+        action="store_true",
+        help="既存の models/（学習途中のチェックポイント含む）をバックアップし、事前学習モデルでリセットする（既定は config.json のみ更新）",
+        default=False,
     )
 
     args = parser.parse_args()
@@ -77,5 +76,5 @@ if __name__ == "__main__":
         val_per_lang=args.val_per_lang,
         log_interval=args.log_interval,
         yomi_error=args.yomi_error,
-        dtype=args.dtype,
+        reset_models=args.reset_models,
     )
