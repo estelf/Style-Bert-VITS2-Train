@@ -4,7 +4,6 @@ from librosa.filters import mel as librosa_mel_fn
 
 from style_bert_vits2.models.commons import reflect_pad_1d
 
-
 # 破棄予告（FutureWarning/DeprecationWarning）を握り潰すとバージョン変更の破壊的変更を検知できなくなるため、
 # プロセス全体の warnings.filterwarnings(action="ignore") は行わない（必要なら呼び出し側で個別に抑止する）
 MAX_WAV_VALUE = 32768.0

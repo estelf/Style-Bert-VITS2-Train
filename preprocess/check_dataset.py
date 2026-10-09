@@ -13,7 +13,6 @@ import soundfile as sf
 
 from style_bert_vits2.logging import logger
 
-
 # soundfile (libsndfile) でメタデータを読める拡張子
 SUPPORTED_SUFFIXES = {".flac", ".wav", ".ogg", ".mp3"}
 

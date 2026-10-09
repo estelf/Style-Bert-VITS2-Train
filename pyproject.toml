@@ -31,12 +31,11 @@ dependencies = [
     "loguru",
     "numba",
     "num2words",
-    "numpy>=2",  # pyopenjtalk-dict はホイールが numpy 1.x ABI 前提のため [tool.uv] でソースビルドしている
+    "numpy>=2",  # pyannote.audio 4.x（train エクストラ）が numpy>=2 を要求する。pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が提供されるためソースビルド不要
     "pydantic>=2.0",
-    "pyopenjtalk-dict",
+    "pyopenjtalk-plus[onnxruntime,tsqyomi]",  # pyopenjtalk のドロップイン代替（import pyopenjtalk のまま）。onnxruntime は「何」読み推定用、tsqyomi は同形異音語の文脈読み選択用
     "pyworld-prebuilt",
     "safetensors",
-    "setuptools<81",  # pyopenjtalk-dict が pkg_resources を使うため（81以降では削除された）
     "soundfile",  # check_dataset.py / data_utils.py の音声読み込み
     "tensorboard",
     "torch>=2.4",
@@ -60,9 +59,9 @@ plot = [
 ]
 
 [project.urls]
-Documentation = "https://github.com/litagin02/Style-Bert-VITS2#readme"
-Issues = "https://github.com/litagin02/Style-Bert-VITS2/issues"
-Source = "https://github.com/litagin02/Style-Bert-VITS2"
+Documentation = "https://github.com/estelf/Style-Bert-VITS2#readme"
+Issues = "https://github.com/estelf/Style-Bert-VITS2/issues"
+Source = "https://github.com/estelf/Style-Bert-VITS2"
 
 [tool.uv.build-backend]
 # フラットレイアウトで style_bert_vits2/ をそのままパッケージ化する（デフォルトの src/  layout ではない）
@@ -80,11 +79,8 @@ source-include = [
 
 [tool.uv]
 # torch 等は PyPI の CUDA ビルドがそのまま入る（必要なら cu12x index を使うこと）
-# pyopenjtalk-dict はホイールが numpy 1.x ABI でビルドされているため、numpy 2 環境では
-# ソースからビルドする（環境構築時に1回だけ発生し、cmake/cython は下のビルド制約で入る。
-# cython は 3.1 以上が必要: 0.29 系で生成した C++ は Python 3.13 の C API でコンパイルできない）
-no-binary-package = ["pyopenjtalk-dict"]
-build-constraint-dependencies = ["cmake<4", "cython>=3.1", "setuptools<81"]
+# pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が全プラットフォーム向けに配布されており、
+# ソースビルド（cmake / cython>=3.1 制約）は不要になった
 
 [dependency-groups]
 dev = [

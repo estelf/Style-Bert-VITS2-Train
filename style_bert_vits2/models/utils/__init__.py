@@ -16,7 +16,6 @@ from style_bert_vits2.models.utils import (
     safetensors,  # type: ignore # noqa: F401
 )
 
-
 if TYPE_CHECKING:
     # tensorboard はライブラリとしてインストールされている場合は依存関係に含まれないため、型チェック時のみインポートする
     from torch.utils.tensorboard import SummaryWriter

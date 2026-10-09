@@ -23,7 +23,6 @@ from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone, kata_tone2phone
 from style_bert_vits2.nlp.japanese.normalizer import normalize_text
 from style_bert_vits2.tts_model import NullModelParam, TTSModelHolder
 
-
 # pyopenjtalk_worker を起動
 ## pyopenjtalk_worker は TCP ソケットサーバーのため、ここで起動する
 pyopenjtalk.initialize_worker()

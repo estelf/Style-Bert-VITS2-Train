@@ -13,7 +13,6 @@ from datetime import datetime
 from style_bert_vits2.constants import DATASET_ROOT
 from style_bert_vits2.logging import logger
 
-
 _logger_handler = None
 
 

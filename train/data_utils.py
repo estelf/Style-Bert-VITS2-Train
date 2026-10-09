@@ -1,6 +1,7 @@
 import os
 import random
 import sys
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,21 @@ from style_bert_vits2.models.utils import load_filepaths_and_text, load_wav_to_t
 from style_bert_vits2.nlp import cleaned_text_to_sequence
 from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 
-
 """Multi speaker version"""
+
+
+@cache
+def _spec_length(
+    audiopath: str, filter_length: int, hop_length: int, win_length: int
+) -> int:
+    """
+    バケット分け用の音声長（スペクトラムフレーム数）を実測値から求める。
+    ファイルサイズからの推定（16bit PCM WAV前提）と違い FLAC でも正確な実フレーム数ベース。
+    ヘッダのみ読むため高速で、結果はパス単位でキャッシュされる。center=False の STFT が実際に
+    出力するフレーム数を再現する（両側に int((filter_length - hop_length) / 2) の reflect パディング）。
+    """
+    pad = 2 * int((filter_length - hop_length) / 2)
+    return (sf.info(audiopath).frames + pad - win_length) // hop_length + 1
 
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
@@ -65,15 +79,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         Filter text & store spec lengths
         """
         # Store spectrogram lengths for Bucketing
-        # ヘッダの正確なサンプル数から、spectrogram_torch / mel_spectrogram_torch（center=False、
-        #   両側に int((filter_length - hop_length) / 2) の reflect パディング）が実際に出力する
-        #   フレーム数を再現して使う（旧方式のファイルサイズ近似は FLAC の圧縮率でズレていた）
+        # 実フレーム数ベースの厳密な出力フレーム数は _spec_length() 側で算出（コメント参照）
 
         audiopaths_sid_text_new = []
         lengths = []
         skipped = 0
-        # spectrogram_torch / mel_spectrogram_torch が STFT 前に両側に足すパディング総量
-        pad = 2 * int((self.filter_length - self.hop_length) / 2)
         logger.info("Init dataset...")
         for _id, spk, language, text, phones, tone, word2ph in tqdm(
             self.audiopaths_sid_text, file=sys.stdout, dynamic_ncols=True
@@ -87,9 +97,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
             # ヘッダ情報から正確なサンプル数を読み、center=False の STFT 出力フレーム数を再現する
-            with sf.SoundFile(audiopath) as f:
-                frames = f.frames
-            lengths.append((frames + pad - self.win_length) // self.hop_length + 1)
+            lengths.append(
+                _spec_length(
+                    audiopath, self.filter_length, self.hop_length, self.win_length
+                )
+            )
             # else:
             #     skipped += 1
         logger.info(
@@ -189,7 +201,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             word2ph[0] += 1
         bert_path = str(Path(wav_path).with_suffix(".bert.pt"))
         try:
-            ja_bert = torch.load(bert_path)
+            ja_bert = torch.load(bert_path, weights_only=True)
             assert ja_bert.shape[-1] == len(phone)
         except Exception as e:
             logger.warning("Bert load Failed")

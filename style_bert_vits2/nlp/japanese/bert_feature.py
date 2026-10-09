@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 from style_bert_vits2.nlp import bert_models
 from style_bert_vits2.nlp.japanese.g2p import text_to_sep_kata
 
-
 if TYPE_CHECKING:
     import torch
 

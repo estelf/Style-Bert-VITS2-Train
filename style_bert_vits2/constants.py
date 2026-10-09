@@ -4,7 +4,6 @@ from pathlib import Path
 
 from style_bert_vits2.utils.strenum import StrEnum
 
-
 # Style-Bert-VITS2 のバージョン（インストール済みパッケージのメタデータ = pyproject.toml の [project].version から取得する）
 VERSION = _pkg_version("style-bert-vits2")
 

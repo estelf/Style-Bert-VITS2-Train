@@ -25,7 +25,6 @@ import pytest
 import torch
 from scipy.io import wavfile
 
-
 # style_bert_vits2 / preprocess を import する前にデータセットルート差し替えを示す（サブプロセスにも継承される）
 TEST_DATA_ROOT = Path(__file__).parent / "data"
 os.environ["SBV2_DATASET_ROOT"] = str(TEST_DATA_ROOT)
@@ -34,7 +33,6 @@ import preprocess as preprocess_pkg  # noqa: E402
 from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT  # noqa: E402
 from style_bert_vits2.logging import logger  # noqa: E402
 from style_bert_vits2.tts_model import TTSModel  # noqa: E402
-
 
 # 入れ替え可能なテストデータセット名（tests/data/<モデル名> を使う）
 MODEL_NAME = os.environ.get(
@@ -57,7 +55,10 @@ def _prepare_dataset():
     特に Step 1 の initialize は reset_models=True で models/ を事前学習モデルでリセットするので、
     学習は常に同じ初期状態の1エポックになり、ゴールデン音声との比較が決定論的に保たれる。
     """
-    if not (DATASET_PATH / "esd.list").is_file() or not (DATASET_PATH / "raw.zip").is_file():
+    if (
+        not (DATASET_PATH / "esd.list").is_file()
+        or not (DATASET_PATH / "raw.zip").is_file()
+    ):
         pytest.skip(
             f"テストデータセット {DATASET_PATH}（esd.list + raw.zip）が未配置です。"
             "データセットは git に含まれないため、各自で tests/data/<モデル名>/ に配置してください"
@@ -139,9 +140,9 @@ def synthesize_and_compare(model_file: Path):
     assert ref_sr == sample_rate, "サンプリングレートが参照音声と一致しません"
     # 学習（use_deterministic_algorithms + CUBLAS_WORKSPACE_CONFIG）と合成はビット単位で再現可能なので、
     # duration の ceil() 量子化も含めて音声長は完全一致してこそ契約である（ズレたら何か壊れた証拠）
-    assert len(audio) == len(ref_audio), (
-        f"音声長が参照音声と一致しません: {len(audio)} != {len(ref_audio)}"
-    )
+    assert len(audio) == len(
+        ref_audio
+    ), f"音声長が参照音声と一致しません: {len(audio)} != {len(ref_audio)}"
 
     # 相関による差分閾値テスト（完全一致ではなく破壊的変更の検知が目的）
     n = min(len(audio), len(ref_audio))

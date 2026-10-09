@@ -2,7 +2,6 @@ import sys
 
 from loguru import logger
 
-
 # Remove all default handlers
 logger.remove()
 

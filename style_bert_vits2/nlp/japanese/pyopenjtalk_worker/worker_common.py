@@ -4,7 +4,6 @@ import socket
 from enum import IntEnum, auto
 from typing import Any, Final
 
-
 # 他のアプリとポートが衝突した場合、環境変数 SBV2_WORKER_PORT で別のポートを指定できる
 WORKER_PORT: Final[int] = int(os.environ.get("SBV2_WORKER_PORT", "7861"))
 # 互換サーバー探索・自前サーバー起動時に試すポート数の上限

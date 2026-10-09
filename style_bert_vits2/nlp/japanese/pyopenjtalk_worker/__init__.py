@@ -13,7 +13,6 @@ from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_common import (
     WORKER_PORT,
 )
 
-
 WORKER_CLIENT: WorkerClient | None = None
 
 

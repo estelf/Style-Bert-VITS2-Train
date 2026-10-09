@@ -14,7 +14,6 @@ from style_bert_vits2.nlp import cleaned_text_to_sequence, extract_bert_feature
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
 
-
 # このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
 pyopenjtalk_worker.initialize_worker()
 
@@ -46,7 +45,7 @@ def process_line(x: tuple[str, bool]):
     bert_path = str(Path(wav_path).with_suffix(".bert.pt"))
 
     try:
-        bert = torch.load(bert_path)
+        bert = torch.load(bert_path, weights_only=True)
         assert bert.shape[-1] == len(phone)
     except Exception:
         bert = extract_bert_feature(text, word2ph, device)

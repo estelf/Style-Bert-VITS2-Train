@@ -24,7 +24,6 @@ from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.voice import adjust_voice
 
-
 if TYPE_CHECKING:
     from style_bert_vits2.models.models_jp_extra import SynthesizerTrn
 

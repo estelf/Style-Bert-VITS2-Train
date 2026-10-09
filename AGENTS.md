@@ -1,6 +1,6 @@
 # AGENTS.md
 
-日本語・JP-Extra 一本化の Style-Bert-VITS2 学習コア（フォーク）。詳細は [docs/GUIDE.md](docs/GUIDE.md)、FAQ は docs/FAQ.md、分割設計は docs/SPLIT_PLAN.md を参照。コメント・ドキュメントは日本語で書かれている。
+日本語・JP-Extra 一本化の Style-Bert-VITS2 学習コア（フォーク）。詳細は [docs/GUIDE.md](docs/GUIDE.md)、分割設計は docs/SPLIT_PLAN.md を参照。コメント・ドキュメントは日本語で書かれている。
 
 ## 実行系の基本
 
@@ -19,13 +19,13 @@
 
 ## ビルド・テストの癖
 
-- `pyopenjtalk-dict` はホイールが numpy 1.x ABI 前提のためソースビルド必須（`[tool.uv]` の no-binary-package / cython>=3.1 制約で担保済み）。GPU 環境では `uv sync` 前後に OS/CUDA に応じた torch を別途入れる（例: `uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl/cu128`）。
+- G2P は `pyopenjtalk-plus`（numpy 2.x 向け事前ビルド済み wheel あり。旧 pyopenjtalk-dict 必要だったソースビルド/cmake/setuptools<81 制約は不要）。`[tsqyomi]` 追加で同形異音語の文脈読み選択、`[onnxruntime]` 追加で「何」読み推定が有効になる。GPU 環境では `uv sync` 前後に OS/CUDA に応じた torch を別途入れる（例: `uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl/cu128`）。
 - 回帰テスト: `uv run pytest -v`（前処理→シード固定42の1エポック学習→合成→ゴールデン音声との相関差分検知。品質検証ではなく契約チェック）。
   - テストデータセット・ゴールデン音声は git に含まれない。`tests/data/<モデル名>/` に配置しないとテストは skip される（clone 直後は存在しないのが正常）。デフォルトは `SBV2_TEST_MODEL=model_1`、差し替えは環境変数で。ゴールデン（`tests/references/`）は初回実行時に自動作成される。
 - リンターは ruff（dev 依存済み。`[tool.ruff.lint].select = ["E4","E7","E9","F","I","UP"]`）、フォーマットは black（dev 依存済み）。実行は `uv run ruff check .` / `uv run black .`。
 
 ## 成果物の置き場
 
-- 学習の途中状態・ログ: `Data/<モデル名>/models/`（G_/D_/WD_*.pth、tfevents。学習曲線は `uv run tensorboard --logdir Data/<モデル名>/models`）。
+- 学習の途中状態・ログ: `Data/<モデル名>/models/`（G_/D_/DUR_/WD_*.pth、tfevents。学習曲線は `uv run tensorboard --logdir Data/<モデル名>/models`）。
 - 推論・共有用3点セット: `model_assets/<モデル名>/`（config.json + `<モデル名>_e<epoch>_s<step>.safetensors` + `style_vectors.npy`）。共有時は3点をセットで渡すこと。名前が統一されていない場合は同じセットの style_vectors.npy/config.json が必要。
 - `pretrained/` の事前学習モデル（bert/jp_extra/slm）は前処理時に自動取得される。一括手動取得は `uv run -m train.initialize`。

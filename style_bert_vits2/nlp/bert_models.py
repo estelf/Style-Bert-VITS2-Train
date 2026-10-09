@@ -25,7 +25,6 @@ from transformers import (
 from style_bert_vits2.constants import DEFAULT_BERT_MODEL_PATH
 from style_bert_vits2.logging import logger
 
-
 if TYPE_CHECKING:
     import torch
 

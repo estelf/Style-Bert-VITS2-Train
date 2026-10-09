@@ -13,7 +13,6 @@ from style_bert_vits2.nlp import clean_text
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
 
-
 # このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
 pyopenjtalk_worker.initialize_worker()
 
@@ -221,7 +220,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val-per-lang",
         type=int,
-        default=0,
+        default=4,
         help="Number of validation data per SPEAKER, not per language (due to compatibility with the original code).",
     )
     parser.add_argument("--max-val-total", type=int, default=12)

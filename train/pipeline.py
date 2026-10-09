@@ -42,7 +42,6 @@ from train.losses import (
 )
 from train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
     True  # If encontered training problem,please try to disable TF32.
@@ -87,6 +86,11 @@ def run():
         "--not_use_custom_batch_sampler",
         help="Don't use custom batch sampler for training, which was used in the version < 2.5",
         action="store_true",
+    )
+    parser.add_argument(
+        "--styles_by_dirs",
+        action="store_true",
+        help="オプション: wavs/ のサブディレクトリごとにスタイルベクトルを生成する（既定は Neutral 1本のみ。フォルダ分けしていても使われない）。Neutral でも十分高い精度が出るため通常は不要",
     )
     args = parser.parse_args()
 
@@ -146,11 +150,14 @@ def run():
             f"Style assets already exist in {out_dir}, so style generation is skipped automatically (resuming)."
         )
     else:
-        default_style.save_styles_by_dirs(
+        # 既定は Neutral 1本のみ（train.list / val.list の発話が算出対象）。サブディレクトリごとのスタイル生成は --styles_by_dirs のときだけ
+        default_style.save_style_vectors(
+            [hps.data.training_files, hps.data.validation_files],
             os.path.join(dataset_path, "wavs"),
             out_dir,
             config_path=config_path,
             config_output_path=os.path.join(out_dir, "config.json"),
+            styles_by_dirs=args.styles_by_dirs,
         )
 
     torch.manual_seed(hps.train.seed)

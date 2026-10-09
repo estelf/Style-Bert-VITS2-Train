@@ -8,7 +8,6 @@ import torch
 
 from style_bert_vits2.logging import logger
 
-
 # チェックポイントとモデルの不一致キー（欠損・形状不一致）がこの件数を超えたら停止する
 # （少数の不一致は旧バージョン互換の再初期化で許容するが、話者数ミス設定のような大規模な不一致は黙って通さない）
 MAX_MISMATCHED_KEYS = 8
@@ -40,7 +39,11 @@ def load_checkpoint(
     """
 
     assert os.path.isfile(checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location=device)
+    # チェックポイントは self-contained な構造（model/optimizer状態のみ）なので明示的に指定する
+    # （torch 2.6+ でデフォルトが True に変更済み。バージョンに依存せず挙動を固定する）
+    checkpoint_dict = torch.load(
+        checkpoint_path, map_location=device, weights_only=True
+    )
     iteration = checkpoint_dict["iteration"]
     learning_rate = checkpoint_dict["learning_rate"]
     logger.info(
