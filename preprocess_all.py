@@ -26,7 +26,8 @@ if __name__ == "__main__":
         "--num_processes",
         type=int,
         help="Number of processes",
-        default=cpu_count() // 2,
+        # 1コア環境だと cpu_count()//2 が 0 になり ThreadPoolExecutor が ValueError を出すため最低1を保証
+        default=max(1, cpu_count() // 2),
     )
     parser.add_argument(
         "--freeze_JP_bert", action="store_true", help="Freeze JP BERT", default=False

@@ -15,7 +15,8 @@ BASE_DIR = Path(__file__).parent.parent
 DATASET_ROOT = Path(os.environ.get("SBV2_DATASET_ROOT", str(BASE_DIR / "Data")))
 
 # 学習済みモデル資産のルート（学習時は {ASSETS_ROOT}/{model_name} に保存し、推論時はここから読み込む）
-ASSETS_ROOT = BASE_DIR / "model_assets"
+## 環境変数 SBV2_ASSETS_ROOT で差し替え可能（回帰テストは tests/model_assets を使い、ユーザーの実モデルを絶対に触らない）
+ASSETS_ROOT = Path(os.environ.get("SBV2_ASSETS_ROOT", str(BASE_DIR / "model_assets")))
 
 # 学習時の分散環境変数のデフォルト（環境変数が未設定の場合に pipeline が使用。上書きしたい場合は環境変数を直接指定）
 TRAIN_ENV_DEFAULTS = {

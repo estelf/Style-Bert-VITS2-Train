@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"  # SPDX表記（旧: AGPL-3.0）
 keywords = []
 authors = [
-    { name = "litagin02", email = "139731664+litagin02@users.noreply.github.com" },
+    { name = "estelf", email = "raisin2468@gmail.com" }
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,8 +25,15 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
+    # accelerate は直接 import しないが、transformers の from_pretrained(device_map=...)
+    # （bert_models.load_model 経由の BERT ロード）が実行時に必須とするためコア依存のまま
     "accelerate",
     "huggingface-hub",  # train/initialize.py の事前学習モデル取得（hf_hub_download）に必要
+    # librosa は train/mel_processing.py の mel 変換行列のみのため、torchaudio への代替も
+    # 検討の余地はあるが、フィルタバンクの数値が微妙に異なる（学習結果＝ゴールデン音声の
+    # 契約が変わる）ため現状は維持。以下4つ（huggingface-hub/librosa/soundfile/tensorboard）は
+    # 学習・前処理専用だが、本リポジトリは「学習コア」として `uv sync`（エクストラ無し）で
+    # 全て揃うことを契約とするためコア依存のまま
     "librosa",
     "loguru",
     "numba",
@@ -37,7 +44,7 @@ dependencies = [
     "pyworld-prebuilt",
     "safetensors",
     "soundfile",  # check_dataset.py / data_utils.py の音声読み込み
-    "tensorboard",
+    "tensorboard",  # train/pipeline.py の学習曲線
     "torch>=2.4",
     "torchaudio>=2.4",
     "tqdm",
@@ -52,10 +59,6 @@ gui = [
 # 学習・前処理チェーン専用（スタイル生成の pyannote.audio。numpy>=2 を要求されるため環境に注意）
 train = [
     "pyannote.audio>=4.0.7",
-]
-# 学習ログのプロット表示用（style_bert_vits2.models.utils の spectrogram/alignment プロット）
-plot = [
-    "matplotlib",
 ]
 
 [project.urls]

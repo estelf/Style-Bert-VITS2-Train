@@ -37,7 +37,8 @@ def generator_loss(disc_outputs):
     for dg in disc_outputs:
         dg = dg.float()
         gen_loss = torch.mean((1 - dg) ** 2)
-        gen_losses.append(gen_loss)
+        # discriminator_loss と同様、ログ用のリストは detach して返す（毎ステップの GPU 同期を防ぐ）
+        gen_losses.append(gen_loss.detach())
         loss += gen_loss
 
     return loss, gen_losses
@@ -62,6 +63,14 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
 
 
 class WavLMLoss(torch.nn.Module):
+    """SLM(WavLM) ベースの敵対学習損失。
+
+    1ステップあたりの WavLM forward を最小化するため、埋め込み計算（encode）を呼び出し側で共有する:
+    - 実音声（no_grad）: 判別器損失と feature matching 損失で共有
+    - 生成音声（no_grad）: 判別器損失のみ
+    - 生成音声（勾配あり）: feature matching 損失と generator 敵対損失で共有
+    """
+
     def __init__(self, model, wd, model_sr, slm_sr=16000):
         super().__init__()
         self.wavlm = AutoModel.from_pretrained(model)
@@ -71,67 +80,59 @@ class WavLMLoss(torch.nn.Module):
         for param in self.wavlm.parameters():
             param.requires_grad = False
 
-    def forward(self, wav, y_rec):
-        with torch.no_grad():
+    def encode(self, wav: torch.Tensor, requires_grad: bool = True):
+        """音声（16kHz へリサンプル済みでなくとも可。内部で resample）から WavLM の hidden states を返す。
+
+        Args:
+            wav (torch.Tensor): (batch, time) の波形
+            requires_grad (bool): False の場合は no_grad で計算する（実音声・判別器用の埋め込み）
+        """
+        if requires_grad:
             wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(
+            return self.wavlm(
                 input_values=wav_16, output_hidden_states=True
             ).hidden_states
-        y_rec_16 = self.resample(y_rec)
-        y_rec_embeddings = self.wavlm(
-            input_values=y_rec_16, output_hidden_states=True
-        ).hidden_states
+        with torch.no_grad():
+            wav_16 = self.resample(wav)
+            return self.wavlm(
+                input_values=wav_16, output_hidden_states=True
+            ).hidden_states
 
+    @staticmethod
+    def _stack(embeddings) -> torch.Tensor:
+        """hidden states のリストを判別器へ渡す形式へ積む。"""
+        return (
+            torch.stack(embeddings, dim=1)
+            .transpose(-1, -2)
+            .flatten(start_dim=1, end_dim=2)
+        )
+
+    def forward(self, wav_embeddings, y_rec_embeddings):
+        """feature matching 損失（loss_lm）。実音声側は no_grad、生成音声側は勾配ありの埋め込みを渡す。"""
         floss = 0
         for er, eg in zip(wav_embeddings, y_rec_embeddings):
             floss += torch.mean(torch.abs(er - eg))
 
         return floss.mean()
 
-    def generator(self, y_rec):
-        y_rec_16 = self.resample(y_rec)
-        y_rec_embeddings = self.wavlm(
-            input_values=y_rec_16, output_hidden_states=True
-        ).hidden_states
-        y_rec_embeddings = (
-            torch.stack(y_rec_embeddings, dim=1)
-            .transpose(-1, -2)
-            .flatten(start_dim=1, end_dim=2)
-        )
+    def generator(self, y_rec_embeddings):
+        """生成器側の敵対損失（loss_lm_gen）。勾配ありの生成音声埋め込みを渡す。"""
+        y_rec_embeddings = self._stack(y_rec_embeddings)
         y_df_hat_g = self.wd(y_rec_embeddings)
         loss_gen = torch.mean((1 - y_df_hat_g) ** 2)
 
         return loss_gen
 
-    def discriminator(self, wav, y_rec):
-        with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(
-                input_values=wav_16, output_hidden_states=True
-            ).hidden_states
-            y_rec_16 = self.resample(y_rec)
-            y_rec_embeddings = self.wavlm(
-                input_values=y_rec_16, output_hidden_states=True
-            ).hidden_states
-
-            y_embeddings = (
-                torch.stack(wav_embeddings, dim=1)
-                .transpose(-1, -2)
-                .flatten(start_dim=1, end_dim=2)
-            )
-            y_rec_embeddings = (
-                torch.stack(y_rec_embeddings, dim=1)
-                .transpose(-1, -2)
-                .flatten(start_dim=1, end_dim=2)
-            )
+    def discriminator(self, wav_embeddings, y_rec_embeddings):
+        """判別器側の損失。両方とも no_grad の埋め込みを渡す（wd のパラメータのみ更新される）。"""
+        y_embeddings = self._stack(wav_embeddings)
+        y_rec_embeddings = self._stack(y_rec_embeddings)
 
         y_d_rs = self.wd(y_embeddings)
         y_d_gs = self.wd(y_rec_embeddings)
 
-        y_df_hat_r, y_df_hat_g = y_d_rs, y_d_gs
-
-        r_loss = torch.mean((1 - y_df_hat_r) ** 2)
-        g_loss = torch.mean((y_df_hat_g) ** 2)
+        r_loss = torch.mean((1 - y_d_rs) ** 2)
+        g_loss = torch.mean((y_d_gs) ** 2)
 
         loss_disc_f = r_loss + g_loss
 
@@ -139,15 +140,7 @@ class WavLMLoss(torch.nn.Module):
 
     def discriminator_forward(self, wav):
         with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(
-                input_values=wav_16, output_hidden_states=True
-            ).hidden_states
-            y_embeddings = (
-                torch.stack(wav_embeddings, dim=1)
-                .transpose(-1, -2)
-                .flatten(start_dim=1, end_dim=2)
-            )
+            y_embeddings = self._stack(self.encode(wav, requires_grad=False))
 
         y_d_rs = self.wd(y_embeddings)
 

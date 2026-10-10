@@ -34,6 +34,9 @@ class HyperParametersTrain(BaseModel):
     freeze_decoder: bool = False
     keep_ckpts: int = 1  # 0 で全チェックポイント保持
     spec_cache: bool = True  # スペクトルキャッシュ（.spec.pt）を使うか
+    num_workers: int = (
+        2  # データローダのワーカー数（.spec.pt キャッシュが無い初回エポックの STFT 並列数。メモリが厳しいなら 1）
+    )
 
 
 class HyperParametersData(BaseModel):

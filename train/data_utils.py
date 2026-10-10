@@ -21,17 +21,17 @@ from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 
 
 @cache
-def _spec_length(
-    audiopath: str, filter_length: int, hop_length: int, win_length: int
-) -> int:
+def _spec_length(audiopath: str, filter_length: int, hop_length: int) -> int:
     """
     バケット分け用の音声長（スペクトラムフレーム数）を実測値から求める。
     ファイルサイズからの推定（16bit PCM WAV前提）と違い FLAC でも正確な実フレーム数ベース。
     ヘッダのみ読むため高速で、結果はパス単位でキャッシュされる。center=False の STFT が実際に
     出力するフレーム数を再現する（両側に int((filter_length - hop_length) / 2) の reflect パディング）。
+    出力フレーム数は窓長ではなく n_fft（=filter_length）で決まる（torch.stft の実測で確認済み。
+    win_length を使うと filter_length != win_length の設定でバケット長が実フレーム数とズレる）。
     """
     pad = 2 * int((filter_length - hop_length) / 2)
-    return (sf.info(audiopath).frames + pad - win_length) // hop_length + 1
+    return (sf.info(audiopath).frames + pad - filter_length) // hop_length + 1
 
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
@@ -97,11 +97,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
             # ヘッダ情報から正確なサンプル数を読み、center=False の STFT 出力フレーム数を再現する
-            lengths.append(
-                _spec_length(
-                    audiopath, self.filter_length, self.hop_length, self.win_length
-                )
-            )
+            lengths.append(_spec_length(audiopath, self.filter_length, self.hop_length))
             # else:
             #     skipped += 1
         logger.info(

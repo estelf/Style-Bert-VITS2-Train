@@ -44,13 +44,13 @@ esd.list の例:
 
 ```bash
 # ① 前処理のみ（Step 1〜6）。epochs・batch_size 等は Data/<モデル名>/config.json に書き込まれる
-uv run preprocess_all.py -m <モデル名> [-b 2] [-e 100] [-s 1000]
+uv run preprocess_all.py -m <モデル名> [-b 4] [-e 100] [-s 1000]
 
 # ② 学習本体（書き込まれた設定で実行。新規も再開も同じコマンド）
 uv run train_model.py -m <モデル名>
 ```
 
-前処理の各ステップと、決定論的に動くようシード固定済みである点（config の seed: 42）以外は気にしなくていい構造です。
+前処理の各ステップと、シード固定済みである点（config の seed: 42）以外は気にしなくていい構造です。学習の決定論モード（cuDNN の決定論カーネル強制）は速度ペナルティがあるため本番では既定 OFF で、回帰テストのみ環境変数 `SBV2_DETERMINISTIC=1` で有効化します。
 
 | Step | モジュール | やること | 出力 |
 |---|---|---|---|
@@ -67,9 +67,9 @@ uv run train_model.py -m <モデル名>
 
 | 引数 | デフォルト | 意味 |
 |---|---|---|
-| `-b, --batch_size` | 2 | バッチサイズ（VRAMが足りないなら下げる） |
+| `-b, --batch_size` | 4 | バッチサイズ（VRAMが足りないなら下げる） |
 | `-e, --epochs` | 100 | エポック数 |
-| `-s, --save_every_steps` | 1000 | このステップごとに保存・学習終了 |
+| `-s, --save_every_steps` | 1000 | このステップごとにチェックポイント・推論資産を保存（学習自体は epochs まで継続） |
 | `--val_per_lang` | 4 | 話者ごとの検証データ数（0 で無効化。検証発話は TensorBoard の eval/ に生成音声・正解音声がログされる） |
 | `--yomi_error` | raise | 読み上げエラーの扱い（raise / skip / use） |
 
@@ -82,7 +82,7 @@ uv run train_model.py -m <モデル名>
 ```
 Data/<モデル名>/models/            ← 学習の途中状態・ログ
   ├─ G_*.pth / D_*.pth / WD_*.pth / DUR_*.pth    チェックポイント（オプティマイザ状態込み、再開用）
-  └─ events.out.tfevents.*           TensorBoard の学習曲線（`uv run -m tensorboard --logdir Data/<モデル名>/models` で閲覧）
+  └─ events.out.tfevents.*           TensorBoard の学習曲線（見方は [TENSORBOARD.md](TENSORBOARD.md)）
 
 model_assets/<モデル名>/           ← 推論・共有用の成果物（この3点セット）
   ├─ config.json                       そのモデルの設定（設計図）
@@ -102,7 +102,7 @@ uv run app.py [--device cuda] [--port <ポート>] [--share]
 
 - 音声合成タブのみ。model_assets/ 配下のモデルを選んで試聴できます。スタイルと強度の選択も可能
 - 学習・前処理はコマンドラインで行うため、GUI に学習設定はありません
-- 学習曲線（TensorBoard）は別途 `uv run tensorboard --logdir Data/<モデル名>/models` で起動して確認します
+- 学習曲線（TensorBoard）は別途 `uv run tensorboard --logdir Data/<モデル名>/models` で起動して確認します。ログの見方は [TENSORBOARD.md](TENSORBOARD.md) を参照
 
 ### Python ライブラリとして使う
 
@@ -124,5 +124,8 @@ sr, audio = model.infer(text="こんにちは", speaker_id=0, style="Neutral")
 ## 補足
 
 - 環境変数 `SBV2_WORKER_PORT`: pyopenjtalk ワーカーのポートを明示指定したい場合のみ（デフォルト7861、使用中なら自動で空きポートを選択）
+- 環境変数 `SBV2_DATASET_ROOT`: データセットルート（デフォルト `Data/`。回帰テストは `tests/data` を使う）
+- 環境変数 `SBV2_ASSETS_ROOT`: 学習済みモデル資産のルート（デフォルト `model_assets/`。回帰テストは `tests/model_assets` を使い、実モデルを絶対に触らない）
+- 環境変数 `SBV2_DETERMINISTIC=1`: 学習の決定論モードを有効化（ゴールデン音声比較用。本番学習は速度優先で既定 OFF）
 - 動作確認済み環境: WSL2 / Ubuntu Desktop。GPU が無い環境でも推論（試聴）は可能です
 - 回帰テスト: `uv run pytest -v`（前処理→学習1エポック→合成→ゴールデン音声との比較が数分で完了します）。データセット・ゴールデンデータは git に含まれないので、各自で用意します。手順は `tests/data/<モデル名>/`（esd.list + raw.zip）にデータを配置して `uv run pytest -v` を実行するだけでよく、ゴールデン音声（`tests/references/`）は初回実行時に自動作成され、2回目以降の実行で差分検知に使われます。別のデータセットに変えたい場合も `tests/data/` に置いて `SBV2_TEST_MODEL=<モデル名>` を指定するだけです（テスト自体は品質検証ではなく、シード固定した1エポック学習ノイズ混じりの出力が壊れていないことの契約チェックです）
