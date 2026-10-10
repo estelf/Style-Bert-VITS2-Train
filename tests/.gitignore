@@ -2,3 +2,5 @@
 # 各自 tests/data/<モデル名>/ にデータを配置し、ゴールデン（tests/references/）はテスト初回実行時に自動生成される。
 /data/
 /references/
+# テストの学習成果物（SBV2_ASSETS_ROOT でここへisolates。実モデル model_assets/ は触らない）
+/model_assets/

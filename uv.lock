@@ -5611,10 +5611,6 @@ dependencies = [
 gui = [
     { name = "gradio" },
 ]
-plot = [
-    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
 train = [
     { name = "pyannote-audio" },
 ]
@@ -5636,7 +5632,6 @@ requires-dist = [
     { name = "huggingface-hub" },
     { name = "librosa" },
     { name = "loguru" },
-    { name = "matplotlib", marker = "extra == 'plot'" },
     { name = "num2words" },
     { name = "numba" },
     { name = "numpy", specifier = ">=2" },
@@ -5652,7 +5647,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers" },
 ]
-provides-extras = ["gui", "train", "plot"]
+provides-extras = ["gui", "train"]
 
 [package.metadata.requires-dev]
 dev = [

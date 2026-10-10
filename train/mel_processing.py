@@ -44,11 +44,8 @@ hann_window = {}
 
 
 def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
-
+    # 値域チェック（torch.min(y) < -1.0 等）はテンソル比較ごとに GPU→CPU 同期を発生させるため、
+    # 学習ループからは呼ばない。データセットの異常値は前処理 Step 3（check_dataset）で検出する
     global hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
     wnsize_dtype_device = str(win_size) + "_" + dtype_device
@@ -113,11 +110,8 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
 def mel_spectrogram_torch(
     y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
 ):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
-
+    # 値域チェックは GPU→CPU 同期を発生させるため、生成器出力に対して毎ステップ呼ぶと
+    # パイプラインがストールする。実音声側の異常値は前処理 Step 3（check_dataset）で検出する
     global mel_basis, hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
     # ハン窓は win_size だけで決まるが、mel 変換行列は n_fft・num_mels・sampling_rate・fmin も効くため全パラメータをキーにする

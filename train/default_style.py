@@ -144,6 +144,41 @@ def save_styles_by_dirs(
     logger.info(f"Saved style config to {config_output_path}")
 
 
+def sync_inference_config(
+    config_path: Path | str,
+    config_output_path: Path | str,
+) -> bool:
+    """再開時にスキップされるスタイル生成の代わりに、推論資産の config.json へ話者情報を反映する。
+
+    前処理（preprocess/text.py）は Data/<モデル名>/config.json の spk2id / n_speakers を毎回更新するが、
+    推論資産 model_assets/<モデル名>/config.json はスタイル生成をスキップすると更新されず、
+    話者構成を変えて前処理し直すと推論が古い話者マップで動いてしまう。
+    style2id / num_styles は既存のスタイルベクトルと対応させるため Data 側で上書きしない。
+
+    Returns:
+        bool: 更新があった場合 True
+    """
+    with open(config_path, encoding="utf-8") as f:
+        json_dict = json.load(f)
+    with open(config_output_path, encoding="utf-8") as f:
+        out_dict = json.load(f)
+
+    updated = False
+    for key in ("spk2id", "n_speakers"):
+        new_value = json_dict["data"].get(key)
+        if key in json_dict["data"] and out_dict["data"].get(key) != new_value:
+            out_dict["data"][key] = new_value
+            updated = True
+
+    if updated:
+        with open(config_output_path, "w", encoding="utf-8") as f:
+            json.dump(out_dict, f, indent=2, ensure_ascii=False)
+        logger.info(
+            f"Updated speaker info (spk2id / n_speakers) in {config_output_path} to match the preprocessed dataset."
+        )
+    return updated
+
+
 def save_style_vectors(
     list_paths: Sequence[Path | str],
     wav_dir: Path | str,

@@ -23,7 +23,8 @@
     "freeze_JP_bert": false,
     "freeze_emo": false,
     "freeze_style": false,
-    "freeze_decoder": false
+    "freeze_decoder": false,
+    "num_workers": 2
   },
   "data": {
     "training_files": "Data/Dummy/train.list",

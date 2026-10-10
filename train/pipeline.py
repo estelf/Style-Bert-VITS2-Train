@@ -3,6 +3,7 @@ import datetime
 import gc
 import os
 import platform
+import socket
 import sys
 from pathlib import Path
 
@@ -16,7 +17,12 @@ from tqdm import tqdm
 from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
 
 # logging.getLogger("numba").setLevel(logging.WARNING)
-from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT, TRAIN_ENV_DEFAULTS
+from style_bert_vits2.constants import (
+    ASSETS_ROOT,
+    BASE_DIR,
+    DATASET_ROOT,
+    TRAIN_ENV_DEFAULTS,
+)
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
 from style_bert_vits2.models.hyper_parameters import HyperParameters
@@ -54,10 +60,12 @@ torch.backends.cuda.enable_mem_efficient_sdp(
     True
 )  # Not available if torch version is lower than 2.0
 
-# GPU 学習は本質的にビット単位の非決定性（conv backward のアトミック加算等）があるが、
-# 回帰テストでゴールデン音声と決定論的に比較できるよう全面決定論化する。
+# 決定論モード（デフォルト OFF）。回帰テストのゴールデン音声比較時のみ環境変数 SBV2_DETERMINISTIC=1 で有効化する。
+# 本番の長時間学習では cuDNN の非決定的最適カーネルが使えるほうが速いため、常時 ON にしない。
 # CUBLAS_WORKSPACE_CONFIG は cuBLAS ハンドル生成時に読まれるため、CUDA 呼び出しより前のモジュール先頭で設定する。
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+DETERMINISTIC = os.environ.get("SBV2_DETERMINISTIC", "0") == "1"
+if DETERMINISTIC:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 global_step = 0
 
@@ -103,10 +111,25 @@ def run():
     # Set log file
     model_dir = os.path.join(dataset_path, "models")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    logger.add(os.path.join(dataset_path, f"train_{timestamp}.log"))
+    # マルチGPUでは全ランクが同じログファイルを掴んで混線するため、rank 0 だけがファイルへ書く
+    # （他ランクはコンソール出力のみ。torchrun 経由ならコンソールがまとめて残る）
+    rank_for_log = int(os.environ.get("RANK", TRAIN_ENV_DEFAULTS["RANK"]))
+    if rank_for_log == 0:
+        logger.add(os.path.join(dataset_path, f"train_{timestamp}.log"))
 
     # Parsing environment variables (デフォルトは定数。環境変数が既に設定されている場合はそれを優先)
-    envs = TRAIN_ENV_DEFAULTS
+    envs = dict(TRAIN_ENV_DEFAULTS)
+    if "MASTER_PORT" not in os.environ:
+        # 既定ポートの固定値は同時実行する2本目が衝突するため、未設定のときだけ空きポートを選ぶ
+        # （torchrun 経由なら MASTER_PORT はランチャー側で設定されるのでここは通らない）
+        try:
+            family, bind_addr = socket.AF_INET6, "::1"
+            socket.socket(family, socket.SOCK_STREAM).close()
+        except OSError:  # IPv6 無効環境では IPv4 ループバックで代替
+            family, bind_addr = socket.AF_INET, "127.0.0.1"
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.bind((bind_addr, 0))
+            envs["MASTER_PORT"] = str(s.getsockname()[1])
     for env_name, env_value in envs.items():
         if env_name not in os.environ.keys():
             logger.info(f"Loading configuration from config {env_value!s}")
@@ -143,34 +166,43 @@ def run():
     os.makedirs(out_dir, exist_ok=True)
 
     # 再開時は推論資産（config.json + style_vectors.npy）が既に揃っているのでスタイル生成は自動でスキップする（CLI指定不要）
-    if (Path(out_dir) / "config.json").exists() and (
-        Path(out_dir) / "style_vectors.npy"
-    ).exists():
-        logger.info(
-            f"Style assets already exist in {out_dir}, so style generation is skipped automatically (resuming)."
-        )
-    else:
-        # 既定は Neutral 1本のみ（train.list / val.list の発話が算出対象）。サブディレクトリごとのスタイル生成は --styles_by_dirs のときだけ
-        default_style.save_style_vectors(
-            [hps.data.training_files, hps.data.validation_files],
-            os.path.join(dataset_path, "wavs"),
-            out_dir,
-            config_path=config_path,
-            config_output_path=os.path.join(out_dir, "config.json"),
-            styles_by_dirs=args.styles_by_dirs,
-        )
+    # マルチGPUでは全ランクが同じ style_vectors.npy / config.json を同時に書かないよう rank 0 のみ実行し、他ランクは完了を待つ
+    if rank == 0:
+        if (Path(out_dir) / "config.json").exists() and (
+            Path(out_dir) / "style_vectors.npy"
+        ).exists():
+            logger.info(
+                f"Style assets already exist in {out_dir}, so style generation is skipped automatically (resuming)."
+            )
+            # スキップしても Data 側の config.json は前処理のたびに更新されているため、話者情報だけを同期する
+            default_style.sync_inference_config(
+                config_path=config_path,
+                config_output_path=os.path.join(out_dir, "config.json"),
+            )
+        else:
+            # 既定は Neutral 1本のみ（train.list / val.list の発話が算出対象）。サブディレクトリごとのスタイル生成は --styles_by_dirs のときだけ
+            default_style.save_style_vectors(
+                [hps.data.training_files, hps.data.validation_files],
+                os.path.join(dataset_path, "wavs"),
+                out_dir,
+                config_path=config_path,
+                config_output_path=os.path.join(out_dir, "config.json"),
+                styles_by_dirs=args.styles_by_dirs,
+            )
+    if n_gpus > 1:
+        dist.barrier()
 
     torch.manual_seed(hps.train.seed)
-    # シード固定だけでは消せない演算カーネルレベルの非決定性を潰す（回帰テストのゴールデン比較の前提）
-    torch.use_deterministic_algorithms(True)
+    # シード固定だけでは消せない演算カーネルレベルの非決定性を潰す（回帰テストのゴールデン比較の前提）。
+    # 決定論カーネルは遅いため、環境変数 SBV2_DETERMINISTIC=1 のときのみ有効化する（本番学習は既定 OFF）
+    if DETERMINISTIC:
+        torch.use_deterministic_algorithms(True)
     torch.cuda.set_device(local_rank)
 
     global global_step
     writer = None
     writer_eval = None
     if rank == 0 and not args.speedup:
-        # logger = utils.get_logger(hps.model_dir)
-        # logger.info(hps)
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
@@ -189,9 +221,9 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # メモリ消費量を減らそうとnum_workersを1にしてみる
-            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
-            num_workers=1,
+            # num_workers は config の train.num_workers（既定2）。.spec.pt キャッシュが無い
+            # 初回エポックの STFT が CPU 並列になり、メモリが厳しい環境では 1 に下げられる
+            num_workers=hps.train.num_workers,
             shuffle=False,
             pin_memory=True,
             collate_fn=collate_fn,
@@ -212,9 +244,8 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # メモリ消費量を減らそうとnum_workersを1にしてみる
-            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
-            num_workers=1,
+            # num_workers は config の train.num_workers（既定2。上のカスタムバッチサンプラー側と同じ）
+            num_workers=hps.train.num_workers,
             # shuffle=True,
             pin_memory=True,
             collate_fn=collate_fn,
@@ -437,10 +468,11 @@ def run():
 
             epoch_str = max(epoch_str, 1)
             # global_step = (epoch_str - 1) * len(train_loader)
-            global_step = int(
+            global_step = (
                 utils.get_steps(
                     utils.checkpoints.get_latest_checkpoint_path(model_dir, "G_*.pth")
                 )
+                or 0
             )
             logger.info(
                 f"******************Found the model. Current epoch is {epoch_str}, gloabl step is {global_step}*********************"
@@ -507,8 +539,14 @@ def run():
         scheduler_wd = torch.optim.lr_scheduler.LambdaLR(
             optim_wd, lr_lambda=lr_lambda, last_epoch=scheduler_last_epoch
         )
+        # slm.model は config テンプレートでは相対パス（"./pretrained/slm/..."）。
+        # CWD 依存を避けるため、相対パスで CWD に無い場合は BASE_DIR 基準に解決する
+        slm_model = hps.model.slm.model
+        slm_path = Path(slm_model)
+        if not slm_path.is_absolute() and not slm_path.exists():
+            slm_model = str(BASE_DIR / slm_model)
         wl = WavLMLoss(
-            hps.model.slm.model,
+            slm_model,
             net_wd,
             hps.data.sampling_rate,
             hps.model.slm.sr,
@@ -533,94 +571,96 @@ def run():
         )
     initial_step = global_step
 
-    for epoch in range(epoch_str, hps.train.epochs + 1):
-        # エポックごとにバッチ構成・順序を変える（self.epoch は set_epoch で初めて反映される）
-        train_sampler.set_epoch(epoch)
-        if rank == 0:
-            train_and_evaluate(
-                rank,
-                local_rank,
-                epoch,
-                hps,
-                [net_g, net_d, net_dur_disc, net_wd, wl],
-                [optim_g, optim_d, optim_dur_disc, optim_wd],
-                [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
-                [train_loader, eval_loader],
-                logger,
-                [writer, writer_eval],
-                pbar,
-                initial_step,
-            )
-        else:
-            train_and_evaluate(
-                rank,
-                local_rank,
-                epoch,
-                hps,
-                [net_g, net_d, net_dur_disc, net_wd, wl],
-                [optim_g, optim_d, optim_dur_disc, optim_wd],
-                [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
-                [train_loader, None],
-                None,
-                None,
-                pbar,
-                initial_step,
-            )
-        scheduler_g.step()
-        scheduler_d.step()
-        if net_dur_disc is not None:
-            scheduler_dur_disc.step()
-        if net_wd is not None:
-            scheduler_wd.step()
-        if epoch == hps.train.epochs:
-            # Save the final models
-            assert optim_g is not None
-            utils.checkpoints.save_checkpoint(
-                net_g,
-                optim_g,
-                hps.train.learning_rate,
-                epoch,
-                os.path.join(model_dir, f"G_{global_step}.pth"),
-            )
-            assert optim_d is not None
-            utils.checkpoints.save_checkpoint(
-                net_d,
-                optim_d,
-                hps.train.learning_rate,
-                epoch,
-                os.path.join(model_dir, f"D_{global_step}.pth"),
-            )
+    # 学習中に例外で抜けてもプロセスグループと進捗バーを確実に閉じる
+    try:
+        for epoch in range(epoch_str, hps.train.epochs + 1):
+            # エポックごとにバッチ構成・順序を変える（self.epoch は set_epoch で初めて反映される）
+            train_sampler.set_epoch(epoch)
+            if rank == 0:
+                train_and_evaluate(
+                    rank,
+                    local_rank,
+                    epoch,
+                    hps,
+                    [net_g, net_d, net_dur_disc, net_wd, wl],
+                    [optim_g, optim_d, optim_dur_disc, optim_wd],
+                    [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
+                    [train_loader, eval_loader],
+                    logger,
+                    [writer, writer_eval],
+                    pbar,
+                    initial_step,
+                )
+            else:
+                train_and_evaluate(
+                    rank,
+                    local_rank,
+                    epoch,
+                    hps,
+                    [net_g, net_d, net_dur_disc, net_wd, wl],
+                    [optim_g, optim_d, optim_dur_disc, optim_wd],
+                    [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
+                    [train_loader, None],
+                    None,
+                    None,
+                    pbar,
+                    initial_step,
+                )
+            scheduler_g.step()
+            scheduler_d.step()
             if net_dur_disc is not None:
-                assert optim_dur_disc is not None
-                utils.checkpoints.save_checkpoint(
-                    net_dur_disc,
-                    optim_dur_disc,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(model_dir, f"DUR_{global_step}.pth"),
-                )
+                scheduler_dur_disc.step()
             if net_wd is not None:
-                assert optim_wd is not None
+                scheduler_wd.step()
+            if epoch == hps.train.epochs:
+                # Save the final models
+                assert optim_g is not None
                 utils.checkpoints.save_checkpoint(
-                    net_wd,
-                    optim_wd,
+                    net_g,
+                    optim_g,
                     hps.train.learning_rate,
                     epoch,
-                    os.path.join(model_dir, f"WD_{global_step}.pth"),
+                    os.path.join(model_dir, f"G_{global_step}.pth"),
                 )
-            utils.safetensors.save_safetensors(
-                net_g,
-                epoch,
-                os.path.join(
-                    out_dir,
-                    f"{model_name}_e{epoch}_s{global_step}.safetensors",
-                ),
-                for_infer=True,
-            )
-
-    if pbar is not None:
-        pbar.close()
-    dist.destroy_process_group()
+                assert optim_d is not None
+                utils.checkpoints.save_checkpoint(
+                    net_d,
+                    optim_d,
+                    hps.train.learning_rate,
+                    epoch,
+                    os.path.join(model_dir, f"D_{global_step}.pth"),
+                )
+                if net_dur_disc is not None:
+                    assert optim_dur_disc is not None
+                    utils.checkpoints.save_checkpoint(
+                        net_dur_disc,
+                        optim_dur_disc,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(model_dir, f"DUR_{global_step}.pth"),
+                    )
+                if net_wd is not None:
+                    assert optim_wd is not None
+                    utils.checkpoints.save_checkpoint(
+                        net_wd,
+                        optim_wd,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(model_dir, f"WD_{global_step}.pth"),
+                    )
+                utils.safetensors.save_safetensors(
+                    net_g,
+                    epoch,
+                    os.path.join(
+                        out_dir,
+                        f"{model_name}_e{epoch}_s{global_step}.safetensors",
+                    ),
+                    for_infer=True,
+                )
+    finally:
+        if pbar is not None:
+            pbar.close()
+        dist.destroy_process_group()
 
 
 def train_and_evaluate(
@@ -766,9 +806,11 @@ def train_and_evaluate(
         if net_wd is not None:
             # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
             # shape: (batch, 1, time)
-            loss_slm = wl.discriminator(
-                y.detach().squeeze(1), y_hat.detach().squeeze(1)
-            ).mean()
+            # WavLM の forward は 1ステップで実音声1回（no_grad）・生成音声1回（勾配あり）に統合する。
+            # 旧実装は forward()/generator()/discriminator() がそれぞれ独立に forward していて倍計算だった。
+            y_embeddings = wl.encode(y.detach().squeeze(1), requires_grad=False)
+            y_rec_embeddings = wl.encode(y_hat.detach().squeeze(1), requires_grad=False)
+            loss_slm = wl.discriminator(y_embeddings, y_rec_embeddings).mean()
 
             optim_wd.zero_grad()
             loss_slm.backward()
@@ -787,8 +829,11 @@ def train_and_evaluate(
         if net_dur_disc is not None:
             _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
         if net_wd is not None:
-            loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-            loss_lm_gen = wl.generator(y_hat.squeeze(1))
+            # 実音声側（y）の WavLM forward は判別器ステップで共有した no_grad 結果を使い、
+            # 生成音声側（y_hat）は勾配を流すため勾配ありで再度 forward する（no_grad 版とは別計算）
+            y_rec_embeddings_grad = wl.encode(y_hat.squeeze(1), requires_grad=True)
+            loss_lm = wl(y_embeddings, y_rec_embeddings_grad).mean()
+            loss_lm_gen = wl.generator(y_rec_embeddings_grad)
         loss_dur = torch.sum(l_length.float())
         loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -800,10 +845,11 @@ def train_and_evaluate(
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
         if net_dur_disc is not None:
             loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-            if net_wd is not None:
-                loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-            else:
-                loss_gen_all += loss_dur_gen
+            loss_gen_all += loss_dur_gen
+        # SLM(WavLM) の敵対学習損失は duration 判別器の有無と無関係に必ず生成器へ加算する
+        # （JP-Extra 既定は use_duration_discriminator: false なので、内側にネストすると常に未加算になっていた）
+        if net_wd is not None:
+            loss_gen_all += loss_lm + loss_lm_gen
         optim_g.zero_grad()
         loss_gen_all.backward()
         # 実際のクリップは毎回必要なので clip_grad_norm_ は残し、その戻り値をログ用にそのまま使う
@@ -875,25 +921,11 @@ def train_and_evaluate(
                             "loss/g/lm_gen": loss_lm_gen,
                         }
                     )
-                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
-                # image_dict = {
-                #     "slice/mel_org": utils.plot_spectrogram_to_numpy(
-                #         y_mel[0].data.cpu().numpy()
-                #     ),
-                #     "slice/mel_gen": utils.plot_spectrogram_to_numpy(
-                #         y_hat_mel[0].data.cpu().numpy()
-                #     ),
-                #     "all/mel": utils.plot_spectrogram_to_numpy(
-                #         mel[0].data.cpu().numpy()
-                #     ),
-                #     "all/attn": utils.plot_alignment_to_numpy(
-                #         attn[0, 0].data.cpu().numpy()
-                #     ),
-                # }
+                # 画像ログ（スペクトログラム・アライメントの TensorBoard 出力）は
+                # matplotlib の削除済み API に依存していたため撤去した（utils.plot_* も削除済み）
                 utils.summarize(
                     writer=writer,
                     global_step=global_step,
-                    # images=image_dict,
                     scalars=scalar_dict,
                 )
 
@@ -967,7 +999,6 @@ def train_and_evaluate(
 
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
-    image_dict = {}
     audio_dict = {}
     print()
     logger.info("Evaluating ...")
@@ -1007,39 +1038,8 @@ def evaluate(hps, generator, eval_loader, writer_eval):
                     sdp_ratio=0.0 if not use_sdp else 1.0,
                 )
                 y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
-                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
-                # mel = spec_to_mel_torch(
-                #     spec,
-                #     hps.data.filter_length,
-                #     hps.data.n_mel_channels,
-                #     hps.data.sampling_rate,
-                #     hps.data.mel_fmin,
-                #     hps.data.mel_fmax,
-                # )
-                # y_hat_mel = mel_spectrogram_torch(
-                #     y_hat.squeeze(1).float(),
-                #     hps.data.filter_length,
-                #     hps.data.n_mel_channels,
-                #     hps.data.sampling_rate,
-                #     hps.data.hop_length,
-                #     hps.data.win_length,
-                #     hps.data.mel_fmin,
-                #     hps.data.mel_fmax,
-                # )
-                # image_dict.update(
-                #     {
-                #         f"gen/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
-                #             y_hat_mel[0].cpu().numpy()
-                #         )
-                #     }
-                # )
-                # image_dict.update(
-                #     {
-                #         f"gt/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
-                #             mel[0].cpu().numpy()
-                #         )
-                #     }
-                # )
+                # 画像ログ（スペクトログラムの TensorBoard 出力）は matplotlib の削除済み API に
+                # 依存していたため撤去した（utils.plot_* も削除済み。音声ログのみ残す）
                 audio_dict.update(
                     {
                         f"gen/audio_{batch_idx}_{use_sdp}": y_hat[
@@ -1052,7 +1052,6 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     utils.summarize(
         writer=writer_eval,
         global_step=global_step,
-        images=image_dict,
         audios=audio_dict,
         audio_sampling_rate=hps.data.sampling_rate,
     )

@@ -3,6 +3,8 @@
 テストデータは tests/data/<モデル名>/（esd.list + raw.zip の完成済みデータセット契約の例）に置く。
 ・データセット・ゴールデンデータは git に含まれないので、開発時に各自で用意する（git clone 直後は存在しないのが正常）
 ・差し替え: データセットを tests/data/ に置いて SBV2_TEST_MODEL を変えるだけでよい（DATASET_ROOT は自動で tests/data に向く）
+・学習成果物（config.json / style_vectors.npy / .safetensors）の保存先は自動で tests/model_assets/ に向く
+  （SBV2_ASSETS_ROOT を設定しているため、ユーザーの実モデル model_assets/ は絶対に削除・上書きされない）
 ・学習は毎回必ず行う（model_assets/ に成果物が残っていてもスキップしない。step1 の initialize は reset_models=True で
   models/ を事前学習モデル（G_0.safetensors）からリセットするため、常に同じ初期状態の1エポックになり、
   ゴールデン音声との比較が決定論的に保たれ、train/ の変更は必ず検出される）
@@ -25,9 +27,15 @@ import pytest
 import torch
 from scipy.io import wavfile
 
-# style_bert_vits2 / preprocess を import する前にデータセットルート差し替えを示す（サブプロセスにも継承される）
+# style_bert_vits2 / preprocess を import する前にデータセットルート・資産ルート差し替えを示す（サブプロセスにも継承される）
 TEST_DATA_ROOT = Path(__file__).parent / "data"
+# 学習成果物の保存先も tests/model_assets へisolates。既定（model_assets/）のままだと
+# テストがユーザーの実モデルの .safetensors を unlink() して削除してしまう
+TEST_ASSETS_ROOT = Path(__file__).parent / "model_assets"
 os.environ["SBV2_DATASET_ROOT"] = str(TEST_DATA_ROOT)
+os.environ["SBV2_ASSETS_ROOT"] = str(TEST_ASSETS_ROOT)
+# ゴールデン音声とのビット単位比較には決定論カーネルが必要（本番学習は速度優先で既定 OFF、テストだけ ON）
+os.environ["SBV2_DETERMINISTIC"] = "1"
 
 import preprocess as preprocess_pkg  # noqa: E402
 from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT  # noqa: E402

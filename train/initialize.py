@@ -4,14 +4,16 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
+from style_bert_vits2.constants import BASE_DIR
 from style_bert_vits2.logging import logger
 
 
 def download_bert_models():
-    with open("pretrained/bert/bert_models.json", encoding="utf-8") as fp:
+    # CWD 依存を避けるため BASE_DIR 基準で解決する
+    with open(BASE_DIR / "pretrained/bert/bert_models.json", encoding="utf-8") as fp:
         models = json.load(fp)
     for k, v in models.items():
-        local_path = Path("pretrained/bert").joinpath(k)
+        local_path = (BASE_DIR / "pretrained/bert").joinpath(k)
         for file in v["files"]:
             if not Path(local_path).joinpath(file).exists():
                 logger.info(f"Downloading {k} {file}")
@@ -19,7 +21,7 @@ def download_bert_models():
 
 
 def download_slm_model():
-    local_path = Path("pretrained/slm/wavlm-base-plus")
+    local_path = BASE_DIR / "pretrained/slm/wavlm-base-plus"
     file = "pytorch_model.bin"
     if not Path(local_path).joinpath(file).exists():
         logger.info(f"Downloading wavlm-base-plus {file}")
@@ -28,7 +30,7 @@ def download_slm_model():
 
 def download_jp_extra_pretrained_models():
     files = ["G_0.safetensors", "D_0.safetensors", "WD_0.safetensors"]
-    local_path = Path("pretrained/jp_extra")
+    local_path = BASE_DIR / "pretrained/jp_extra"
     for file in files:
         if not Path(local_path).joinpath(file).exists():
             logger.info(f"Downloading JP-Extra pretrained {file}")

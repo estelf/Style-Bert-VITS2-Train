@@ -101,9 +101,9 @@ def preprocess(
                 )
                 out_file.write(processed_line)
             except Exception as e:
-                logger.error(
-                    f"An error occurred at line:\n{line.strip()}\n{e}", encoding="utf-8"
-                )
+                # loguru の logger.error に kwargs（encoding 等）を渡すと message に
+                # str.format() が走り、セリフ中の { が KeyError を呼ぶ。第1引数のみで渡す
+                logger.error(f"An error occurred at line:\n{line.strip()}\n{e}")
                 write_error_log(error_log_path, line, e)
                 error_count += 1
 

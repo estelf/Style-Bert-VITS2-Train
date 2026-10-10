@@ -10,7 +10,7 @@ import shutil
 import zipfile
 from datetime import datetime
 
-from style_bert_vits2.constants import DATASET_ROOT
+from style_bert_vits2.constants import BASE_DIR, DATASET_ROOT, VERSION
 from style_bert_vits2.logging import logger
 
 _logger_handler = None
@@ -50,9 +50,13 @@ def initialize(
         f"Step 1: start initialization...\nmodel_name: {model_name}, batch_size: {batch_size}, epochs: {epochs}, save_every_steps: {save_every_steps}, freeze_JP_bert: {freeze_JP_bert}, freeze_style: {freeze_style}, freeze_decoder: {freeze_decoder}, log_interval: {log_interval}, reset_models: {reset_models}"
     )
 
-    with open("configs/config_jp_extra.json", encoding="utf-8") as f:
+    # CWD 依存を避けるため BASE_DIR 基準で解決する
+    with open(BASE_DIR / "configs/config_jp_extra.json", encoding="utf-8") as f:
         config = json.load(f)
     config["model_name"] = model_name
+    # config の version はモデルフォーマットの識別子（推論時の互換判定に使う）。
+    # パッケージバージョン（pyproject.toml）から生成して手動同期を無くす
+    config["version"] = f"{VERSION}-JP-Extra"
     config["data"]["training_files"] = str(dataset_path / "train.list")
     config["data"]["validation_files"] = str(dataset_path / "val.list")
     config["train"]["batch_size"] = batch_size
@@ -79,7 +83,7 @@ def initialize(
                 src=model_path, dst=dataset_path / "models_backup", dirs_exist_ok=True
             )
             shutil.rmtree(model_path)
-        shutil.copytree(src="pretrained/jp_extra", dst=model_path)
+        shutil.copytree(src=BASE_DIR / "pretrained/jp_extra", dst=model_path)
 
     with open(dataset_path / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)

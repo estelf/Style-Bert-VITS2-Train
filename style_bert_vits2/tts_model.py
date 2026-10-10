@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from style_bert_vits2.constants import (
     DEFAULT_ASSIST_TEXT_WEIGHT,
@@ -28,18 +28,8 @@ if TYPE_CHECKING:
     from style_bert_vits2.models.models_jp_extra import SynthesizerTrn
 
 
-class NullModelParam(BaseModel):
-    """
-    ヌルモデルのパラメータを表す Pydantic モデル。
-    各パラメータは 0.0 から 1.0 の範囲で指定する。
-    """
-
-    name: str  # モデル名
-    path: Path  # モデルファイルのパス
-    weight: float = Field(ge=0.0, le=1.0)  # 声質の重み
-    pitch: float = Field(ge=0.0, le=1.0)  # 声の高さの重み
-    style: float = Field(ge=0.0, le=1.0)  # 話し方の重み
-    tempo: float = Field(ge=0.0, le=1.0)  # テンポの重み
+# ヌルモデル（複数モデルのマージ）機能は SPLIT_PLAN.md §3.2 の決定により撤去した
+# （マージはユーティリティリポジトリ側で本パッケージを使う形で提供する）
 
 
 class TTSModel:
@@ -114,9 +104,8 @@ class TTSModel:
             )
         self.style_vector_inference: Any | None = None
 
-        # net_g / null_model_params は遅延初期化される
+        # net_g は遅延初期化される
         self.net_g: SynthesizerTrn | None = None
-        self.null_model_params: dict[int, NullModelParam] | None = None
 
     def load(self) -> None:
         """
@@ -139,45 +128,6 @@ class TTSModel:
         )
         logger.info(
             f'Model loaded successfully from {self.model_path} to "{self.device}" device ({time.time() - start_time:.2f}s)'
-        )
-
-        # ここからはヌルモデルのロード用パラメータが指定されている場合のみ
-        if self.null_model_params is None:
-            return
-
-        # 推論対象のモデルの重みとヌルモデルの重みをマージ
-        for null_model_info in self.null_model_params.values():
-            logger.info(f"Adding null model: {null_model_info.path}...")
-            null_model_add = get_net_g(
-                model_path=str(null_model_info.path),
-                version=self.hyper_parameters.version,
-                device=self.device,
-                hps=self.hyper_parameters,
-                dtype=getattr(torch, self.dtype),
-            )
-            # 愚直。もっと上手い方法ありそう
-            params = zip(self.net_g.dec.parameters(), null_model_add.dec.parameters())
-            for v in params:
-                v[0].data.add_(v[1].data, alpha=float(null_model_info.weight))
-            params = zip(self.net_g.flow.parameters(), null_model_add.flow.parameters())
-            for v in params:
-                v[0].data.add_(v[1].data, alpha=float(null_model_info.pitch))
-
-            params = zip(
-                self.net_g.enc_p.parameters(), null_model_add.enc_p.parameters()
-            )
-            for v in params:
-                v[0].data.add_(v[1].data, alpha=float(null_model_info.style))
-            # テンポは sdp と dp 二つあるからとりあえずどっちも足す
-            params = zip(self.net_g.sdp.parameters(), null_model_add.sdp.parameters())
-            for v in params:
-                v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
-            params = zip(self.net_g.dp.parameters(), null_model_add.dp.parameters())
-            for v in params:
-                v[0].data.add_(v[1].data, alpha=float(null_model_info.tempo))
-
-        logger.info(
-            f"Null models merged successfully ({time.time() - start_time:.2f}s)"
         )
 
     def unload(self) -> None:
@@ -273,7 +223,10 @@ class TTSModel:
 
         # Based on: https://docs.scipy.org/doc/scipy/reference/generated/scipy.io.wavfile.write.html
         if data.dtype in [np.float64, np.float32, np.float16]:  # type: ignore
-            data = data / np.abs(data).max()
+            # 無音入力だと max が 0 で 0 除算 → NaN になるため、正規化は最大値があるときだけ行う
+            max_abs = np.abs(data).max() if data.size else 0.0
+            if max_abs > 0:
+                data = data / max_abs
             data = data * 32767
             data = data.astype(np.int16)
         elif data.dtype == np.int32:
@@ -318,8 +271,6 @@ class TTSModel:
         given_tone: list[int] | None = None,
         pitch_scale: float = 1.0,
         intonation_scale: float = 1.0,
-        null_model_params: dict[int, NullModelParam] | None = None,
-        force_reload_model: bool = False,
     ) -> tuple[int, NDArray[Any]]:
         """
         テキストから音声を合成する。
@@ -343,8 +294,6 @@ class TTSModel:
             given_tone (Optional[list[int]], optional): アクセントのトーンのリスト. Defaults to None.
             pitch_scale (float, optional): ピッチの高さ (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
             intonation_scale (float, optional): 抑揚の平均からの変化幅 (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
-            null_model_params (Optional[dict[int, NullModelParam]], optional): 推論時に使用するヌルモデルの情報。
-            force_reload_model (bool, optional): モデルを強制的に再ロードするかどうか. Defaults to False.
         Returns:
             tuple[int, NDArray[Any]]: サンプリングレートと音声データ (16bit PCM)
         """
@@ -369,15 +318,6 @@ class TTSModel:
         from style_bert_vits2.models.infer import infer
 
         start_time = time.time()
-
-        if null_model_params is not None:
-            self.null_model_params = null_model_params
-        else:
-            self.null_model_params = None
-
-        # force_reload_model が True のとき、メモリ上に保持されているモデルを破棄する
-        if force_reload_model is True:
-            self.net_g = None
 
         # モデルがロードされていない場合はロードする
         if self.net_g is None:
@@ -427,7 +367,16 @@ class TTSModel:
                         )
                     )
                     if i != len(texts) - 1:
-                        audios.append(np.zeros(int(44100 * split_interval)))
+                        # 改行間無音は config のサンプリングレートで生成（44100 ハードコードだと
+                        # 別レートのモデルで無音長がズレる）
+                        audios.append(
+                            np.zeros(
+                                int(
+                                    self.hyper_parameters.data.sampling_rate
+                                    * split_interval
+                                )
+                            )
+                        )
                 audio = np.concatenate(audios)
 
         logger.info(
@@ -504,6 +453,14 @@ class TTSModelHolder:
         self.model_names = []
         self.current_model = None
         self.models_info = []
+
+        # model_assets/ 自体が無い環境（学習を一度もしていない clone 直後など）で即死しないよう警告だけ出す
+        if not self.root_dir.exists():
+            logger.warning(
+                f"Model root directory {self.root_dir} does not exist. "
+                "No models will be listed."
+            )
+            return
 
         model_dirs = sorted([d for d in self.root_dir.iterdir() if d.is_dir()])
         for model_dir in model_dirs:

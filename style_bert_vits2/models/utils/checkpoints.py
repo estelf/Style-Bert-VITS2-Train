@@ -167,7 +167,10 @@ def clean_checkpoints(
     ]
 
     def name_key(_f: str) -> int:
-        return int(re.compile("._(\\d+)\\.pth").match(_f).group(1))  # type: ignore
+        # .pth と .safetensors の両方に対応（sort_by_time=False で名前順を使う場合に落ちないよう、
+        # 数字を含まないファイルは先頭（最も古い扱い）に寄せる）
+        match = re.search(r"_(\d+)\.(pth|safetensors)$", _f)
+        return int(match.group(1)) if match else -1
 
     def time_key(_f: str) -> float:
         return os.path.getmtime(os.path.join(model_dir_path, _f))
@@ -175,8 +178,17 @@ def clean_checkpoints(
     sort_key = time_key if sort_by_time else name_key
 
     def x_sorted(_x: str) -> list[str]:
+        # 事前学習ベース（G_0.pth / G_0.safetensors 等）は絶対に削除しない。
+        # 本フォークの事前学習モデルは .safetensors なので、.pth だけ除外していたと
+        # keep_ckpts 回の保存で黙って削除され、再開時にランダム初期化で学習が再開されていた
         return sorted(
-            [f for f in ckpts_files if f.startswith(_x) and not f.endswith("_0.pth")],
+            [
+                f
+                for f in ckpts_files
+                if f.startswith(_x)
+                and not f.endswith("_0.pth")
+                and not f.endswith("_0.safetensors")
+            ],
             key=sort_key,
         )
 

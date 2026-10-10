@@ -20,35 +20,41 @@ pyopenjtalk_worker.initialize_worker()
 # dict_data/ 以下の辞書データを pyopenjtalk に適用
 update_dict()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--device", type=str, default="cuda")
-parser.add_argument(
-    "--dtype",
-    type=str,
-    default="float16",
-    choices=["float32", "float16"],
-    help="推論時の重みの精度（既定 float16 = フル半精度推論。float32 で全精度）。bfloat16 は精度劣化が大きいため推論では非対応",
-)
-parser.add_argument("--host", type=str, default="127.0.0.1")
-parser.add_argument("--port", type=int, default=None)
-parser.add_argument("--no_autolaunch", action="store_true")
-parser.add_argument("--share", action="store_true")
 
-args = parser.parse_args()
-device = args.device
-if device == "cuda" and not torch.cuda.is_available():
-    device = "cpu"
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float16",
+        choices=["float32", "float16"],
+        help="推論時の重みの精度（既定 float16 = フル半精度推論。float32 で全精度）。bfloat16 は精度劣化が大きいため推論では非対応",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--no_autolaunch", action="store_true")
+    parser.add_argument("--share", action="store_true")
 
-model_holder = TTSModelHolder(ASSETS_ROOT, device, dtype=args.dtype)
+    args = parser.parse_args()
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
 
-with gr.Blocks() as app:
-    gr.Markdown(f"# Style-Bert-VITS2 試聴GUI (version {VERSION})")
-    create_inference_app(model_holder=model_holder)
+    model_holder = TTSModelHolder(ASSETS_ROOT, device, dtype=args.dtype)
 
-app.launch(
-    theme=GRADIO_THEME,
-    server_name=args.host,
-    server_port=args.port,
-    inbrowser=not args.no_autolaunch,
-    share=args.share,
-)
+    with gr.Blocks() as app:
+        gr.Markdown(f"# Style-Bert-VITS2 試聴GUI (version {VERSION})")
+        create_inference_app(model_holder=model_holder)
+
+    app.launch(
+        theme=GRADIO_THEME,
+        server_name=args.host,
+        server_port=args.port,
+        inbrowser=not args.no_autolaunch,
+        share=args.share,
+    )
+
+
+if __name__ == "__main__":
+    main()

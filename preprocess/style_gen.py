@@ -111,11 +111,14 @@ if __name__ == "__main__":
             f"Found NaN value in {len(nan_val_lines)} files: {nan_files}, so they will be deleted from validation data."
         )
 
-    with open(hps.data.training_files, "w", encoding="utf-8") as f:
-        f.writelines(ok_training_lines)
-
-    with open(hps.data.validation_files, "w", encoding="utf-8") as f:
-        f.writelines(ok_val_lines)
+    # NaN を含む行だけを除外して書き戻す（NaN が1件も無いなら train.list/val.list に触らない。
+    # 無条件の書き換えは再実行のたびに元リストが破壊的に縮む罠になるため）
+    if nan_training_lines:
+        with open(hps.data.training_files, "w", encoding="utf-8") as f:
+            f.writelines(ok_training_lines)
+    if nan_val_lines:
+        with open(hps.data.validation_files, "w", encoding="utf-8") as f:
+            f.writelines(ok_val_lines)
 
     ok_num = len(ok_training_lines) + len(ok_val_lines)
 
