@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any
 
@@ -89,4 +90,15 @@ def save_safetensors(
     new_dict["iteration"] = torch.LongTensor([iteration])
     logger.info(f"Saved safetensors to {checkpoint_path}")
 
-    save_file(new_dict, checkpoint_path)
+    # チェックポイント本体と同じく原子的保存（一時ファイル → os.replace）。
+    # 推論資産の .safetensors が途中で壊れると、そのファイルを選んだ推論・評価が
+    # 後から気づかない形で失敗する
+    checkpoint_path = Path(checkpoint_path)
+    tmp_path = checkpoint_path.with_name(f"{checkpoint_path.name}.tmp{os.getpid()}")
+    try:
+        save_file(new_dict, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise

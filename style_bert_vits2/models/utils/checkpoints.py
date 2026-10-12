@@ -135,15 +135,27 @@ def save_checkpoint(
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
-    torch.save(
-        {
-            "model": state_dict,
-            "iteration": iteration,
-            "optimizer": optimizer.state_dict(),
-            "learning_rate": learning_rate,
-        },
-        checkpoint_path,
-    )
+    # 原子的保存: 同一ディレクトリ内の一時ファイルへ書いてから os.replace する。
+    # 途中クラッシュで壊れた .pth が最新の再開状態を黙って潰すと、次回再開時に
+    # 読み込み失敗 → （--allow_scratch 無効なら）学習不能になる。rename はアトミック
+    # なので、既存チェックポイントは必ず前回の正常な状態に保たれる
+    tmp_path = f"{checkpoint_path}.tmp{os.getpid()}"
+    try:
+        torch.save(
+            {
+                "model": state_dict,
+                "iteration": iteration,
+                "optimizer": optimizer.state_dict(),
+                "learning_rate": learning_rate,
+            },
+            tmp_path,
+        )
+        os.replace(tmp_path, checkpoint_path)
+    except BaseException:
+        # 書き込み失敗時は一時ファイルを残さない（学習本番の disk 障害でゴミが溜まるのを防ぐ）
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def clean_checkpoints(

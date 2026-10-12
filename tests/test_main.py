@@ -11,10 +11,15 @@
 ・ゴールデンデータについて: 学習は意図的に1エポック（シード固定42）しか行わないため重みはノイズ混じりだが、
   その出力こそがゴールデン（tests/references/）である。目的は品質検証ではなく、transformers 等のバージョン変更で
   BERT 出力＝推論結果が破壊的に変わったことを相関差分検知するためのもので、「1エポックのノイズ音声」でも契約として一致を見る必要がある。
-  ※train/pipeline.py で torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG を有効化しているため、
-    GPU 学習でもビット単位で再現可能。音声長・波形ともゴールデンと一致して初めて通る強い契約チェックになっている。
+  ※train/pipeline.py で torch.use_deterministic_algorithms(True, warn_only=True) + CUBLAS_WORKSPACE_CONFIG を
+    有効化しているため、GPU 学習でもビット単位で再現可能（warn_only は決定論カーネルが無い op でのみ
+    例外の代わりに警告で従来カーネルへフォールバックする保険。torch 更新で新規 op が非決定扱いになっても
+    テスト自体は止まり、相関閾値で破壊的変更を検知する）。音声長・波形ともゴールデンと一致して初めて通る強い契約チェックになっている。
 ・train/pipeline.py は nccl / torch.cuda.set_device() / .cuda() を無条件に使うため CPU では学習できない（CPU 学習非対応）。
   よって学習を伴うテストは CUDA がある環境でのみ実行され、無い環境では skip される。
+・ゴールデン音声は tests/references/<モデル名>/ に自動作成される。G2P の挙動が変わる変更
+  （pyopenjtalk-plus のバージョンや tsqyomi/onnxruntime extras の有効化、dict_data/ 辞書更新）を
+  いれたときはゴールデンを削除して再生成すること（読みが変われば学習結果も変わるため、旧ゴールデンは不一致になる）。
 """
 
 import os
@@ -27,16 +32,11 @@ import pytest
 import torch
 from scipy.io import wavfile
 
-# style_bert_vits2 / preprocess を import する前にデータセットルート・資産ルート差し替えを示す（サブプロセスにも継承される）
-TEST_DATA_ROOT = Path(__file__).parent / "data"
-# 学習成果物の保存先も tests/model_assets へisolates。既定（model_assets/）のままだと
-# テストがユーザーの実モデルの .safetensors を unlink() して削除してしまう
-TEST_ASSETS_ROOT = Path(__file__).parent / "model_assets"
-os.environ["SBV2_DATASET_ROOT"] = str(TEST_DATA_ROOT)
-os.environ["SBV2_ASSETS_ROOT"] = str(TEST_ASSETS_ROOT)
-# ゴールデン音声とのビット単位比較には決定論カーネルが必要（本番学習は速度優先で既定 OFF、テストだけ ON）
-os.environ["SBV2_DETERMINISTIC"] = "1"
-
+# データセットルート（tests/data）・学習成果物の保存先（tests/model_assets）・決定論モードの
+# 環境変数は tests/conftest.py で設定する。constants は import 時にこれらの環境変数を
+# モジュール定数としてバインドするため、conftest 経由で全テストモジュールより先に設定しないと
+# `pytest tests/` の import 順で既定の Data/ が確定して黙って skip される（conftest.py 参照）。
+# 既定の Data/・model_assets/ のままだとテストがユーザーの実モデルを削除・上書きする点にも注意
 import preprocess as preprocess_pkg  # noqa: E402
 from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT  # noqa: E402
 from style_bert_vits2.logging import logger  # noqa: E402
@@ -108,7 +108,11 @@ def trained_model_path() -> Path:
         [sys.executable, "-m", "train.pipeline", "--model_name", MODEL_NAME],
         check=True,
     )
-    g_files = sorted(MODELS_PATH.glob("*.safetensors"))
+    # ゴールデン音声の契約は「通常重み（live weights）」の出力。ema_decay 既定有効で
+    # *_ema.safetensors が併記されるため、候補から明示的に除外する
+    g_files = sorted(
+        p for p in MODELS_PATH.glob("*.safetensors") if not p.stem.endswith("_ema")
+    )
     assert len(g_files) > 0, "学習済みモデルが見つかりません"
     return g_files[0]
 

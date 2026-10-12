@@ -67,26 +67,79 @@ uv run train_model.py -m <モデル名>
 
 | 引数 | デフォルト | 意味 |
 |---|---|---|
-| `-b, --batch_size` | 4 | バッチサイズ（VRAMが足りないなら下げる） |
-| `-e, --epochs` | 100 | エポック数 |
-| `-s, --save_every_steps` | 1000 | このステップごとにチェックポイント・推論資産を保存（学習自体は epochs まで継続） |
+| `-b, --batch_size` | 未指定=既存 config.json を維持 | バッチサイズ（VRAMが足りないなら下げる） |
+| `-e, --epochs` | 未指定=既存 config.json を維持 | エポック数の**打ち切り上限**（早期停止が既定有効のため、収束すればこの前に自動停止する） |
+| `-s, --save_every_steps` | 未指定=既存 config.json を維持 | このステップごとにチェックポイント・推論資産を保存（学習自体は epochs 上限または早期停止まで継続） |
 | `--val_per_lang` | 4 | 話者ごとの検証データ数（0 で無効化。検証発話は TensorBoard の eval/ に生成音声・正解音声がログされる） |
 | `--yomi_error` | raise | 読み上げエラーの扱い（raise / skip / use） |
+| `--freeze_JP_bert` / `--freeze_style` / `--freeze_decoder` | 未指定=既存 config.json を維持 | 指定したときだけ true になる。false に戻すには config.json を直接編集 |
+
+前処理の Step 1 は**既存 config.json の設定値を維持**します（テンプレートに既存値を重ねて更新）。learning_rate や early_stopping_* など CLI 引数に対応しないキーの手動編集は再実行でも失われません。まっさらにしたい場合は `Data/<モデル名>/config.json` を削除してください。
 
 学習の再開は、同じモデル名で `uv run train_model.py -m <モデル名>` を実行するだけです。スタイル生成は `model_assets/<モデル名>/` に推論資産（config.json + style_vectors.npy）が既にあれば自動でスキップされるため、コマンドラインでの指定は不要です。
 
+再開時のチェックポイント読み込みが失敗した場合（破損・config とモデルの不整合など）、**既定では学習を開始せずエラー終了します**。そのままスクラッチ学習へフォールバックすると、keep_ckpts による旧チェックポイント削除で学習進捗が失われるためです。意図的にスクラッチへ切り替える場合のみ `uv run train_model.py -m <モデル名> --allow_scratch` を明示してください。
+
+BERT特徴キャッシュ（`*.bert.pt`）には生成根拠（テキスト＋word2ph）のハッシュが保存されます。esd.list のリテイクや `dict_data/` 辞書更新で**読みが変わった**状態で学習を開始すると、古い特徴は使わずエラーになるため、`preprocess_all.py` を再実行して Step 5 をやり直してください（変更が無ければキャッシュは再利用され高速です）。
+
 スタイルは **Neutral 1本のみが既定**です（Neutral だけでも十分高い精度が出るため）。サブディレクトリごとにスタイルを分けたい場合だけ `uv run train_model.py -m <モデル名> --styles_by_dirs` を明示してください（フォルダ分けしていてもこのフラグが無ければ Neutral として扱われます）。
+
+### 早期停止と best checkpoint の自動選定
+
+早期停止は **既定で有効** です。`eval_interval` ごとに **val.list の検証損失**（非敵対損失のみ）を計算し、以下の条件のどちらかで学習を停止します。設定は `Data/<モデル名>/config.json` の `train`（キーが無い既存 config も Pydantic 既定値で動きます）。
+
+```json
+"early_stopping_enabled": true,          // 既定 true。無効化すれば epochs まで回し切る
+"early_stopping_monitor": "mel",         // mel | dur | kl | total
+"early_stopping_min_steps": 3000,        // 今回の学習開始点（再開時は再開step）からこの経過step以降の評価だけを判定に使う。0 で全履歴対象
+"early_stopping_patience": 10,           // best 更新が無い評価が続いたら停止
+"early_stopping_min_delta": 0.001,       // これ未満の改善は best 更新とみなさない
+"early_stopping_plateau_window": 5,      // プラトー検出の窓（0 で無効）
+"early_stopping_plateau_slope_eps": 0.002 // 窓内回帰傾きが |平均|×この値 以下で停止
+```
+
+- 監視指標は TensorBoard に `val/*` として記録されます。全履歴は `models/eval_history.json` に保存されますが、**判定には `early_stopping_min_steps` 経過後の評価のみを使い**、それ以前の履歴（再開前を含む）は best・patience・プラトー窓に一切数えません
+- 履歴には val.list の内容ハッシュが記録され、**検証セットを変更した場合は旧検証セット上の損失を判定から除外します**（別セットの損失と混ぜて best を誤判定しないため）
+- そのため新規・再開のどちらでも、最低 `min_steps` は学習が積まれてから判定が始まります（既定 eval_interval=1000 なら、停止最早は新規で step 8000=プラトー経路 / 14000=patience経路、step 3100 からの再開なら 11000 / 17000）
+- 停止してもチェックポイント・safetensors は評価ステップ分まで保存済みのまま終了します
+- val.list が空（前処理で `--val_per_lang 0`）の場合や `--speedup` 指定時は早期停止が機能しないため、**開始時に警告を出してから epochs 上限まで走ります**
+- val が数文しかない小規模データセットでは評価がノイジーなので、早すぎる停止が出るようなら patience を長め（8〜15）に、plateau_window を 0（無効）に調整してください
+
+監視 best（検証損失上の最良）は毎回 `models/best_checkpoint.json` に記録され、対応する `.safetensors` は `model_assets/<モデル名>/best.safetensors` としても1点コピーされます。`keep_safetensors` で古い eval 資産を間引いても best の実体は残ります。
+
+学習中に `model_assets/<モデル名>/` へ溜まった `<モデル名>_e<epoch>_s<step>.safetensors` 群から推論に使いたい1点を選ぶには、品質メトリクスでの評価スクリプトを使います。
+
+```bash
+uv run -m train.select_best -m <モデル名> [--utmos] [--spk-sim]   # val.list をシード42で合成して評価
+```
+
+`mel_corr`（正解音声との log-mel 相関）を基に、`--utmos` で UTMOS（MOS予測）、`--spk-sim` で話者類似度（pyannote wespeaker 埋め込みの cos 類似度、HF トークン必要）を併用でき、順位合計で best を選び `model_assets/<モデル名>/best_selection.json` に保存します。レポートには早期停止が記録した `best_checkpoint.json`（検証損失 best）も併記され、合成品質 best との一致・不一致を確認できます。
+
+### 学習の高度な設定（config.json `train`）
+
+既定値のまま従来動作で、必要に応じて調整するキーです（`ema_decay` のみ既定で有効）。
+
+```json
+"accumulation_steps": 1,          // 勾配累積ステップ数。VRAM 不足で batch_size を上げられない時の実効バッチ拡大用（DDP の no_sync で中間ステップの通信を省略）
+"adversarial_warmup_steps": 0,    // 敵対損失（fm/gen/dur_gen/lm 系）を学習開始から線形に 0→1 スケールするステップ数。判別器未熟期の暴れ防止。0 で無効
+"ema_decay": 0.999,               // 生成器パラメータの EMA 減衰率（0 で無効）。評価・最終保存に `<モデル名>_e<epoch>_s<step>_ema.safetensors` が併記される。best.safetensors と早期停止の判定は検証損失を実測している通常重み側で行うため、_ema は聞き比べ・select_best 用の候補となる
+"keep_safetensors": 0,            // model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し（best.safetensors と best の step は常に保持）
+"nan_guard_max_skips": 10         // 非有限損失（NaN/inf）がこの回数連続で出たら学習停止。発生前の重みは保持され、検出ステップは更新をスキップ。0 で無効
+```
 
 ## 3. 成果物はどこに生成されるか
 
 ```
 Data/<モデル名>/models/            ← 学習の途中状態・ログ
   ├─ G_*.pth / D_*.pth / WD_*.pth / DUR_*.pth    チェックポイント（オプティマイザ状態込み、再開用）
+  ├─ eval_history.json               検証損失の全履歴（早期停止の判定単位。val.list のハッシュ付き）
+  ├─ best_checkpoint.json            監視指標上の best（どの .safetensors を推論に使うべきか）
   └─ events.out.tfevents.*           TensorBoard の学習曲線（見方は [TENSORBOARD.md](TENSORBOARD.md)）
 
 model_assets/<モデル名>/           ← 推論・共有用の成果物（この3点セット）
   ├─ config.json                       そのモデルの設定（設計図）
-  ├─ <モデル名>_e<epoch>_s<step>.safetensors  学習済み重み
+  ├─ <モデル名>_e<epoch>_s<step>.safetensors  学習済み重み（ema_decay 有効時は *_ema.safetensors も併記）
+  ├─ best.safetensors                  監視 best のコピー（keep_safetensors で間引かれても残る）
   └─ style_vectors.npy                 スタイルベクトル（既定は Neutral 1本のみ。--styles_by_dirs 時はフォルダ分けの各スタイル分も）
 ```
 

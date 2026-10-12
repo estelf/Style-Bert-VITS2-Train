@@ -32,13 +32,13 @@ dependencies = [
     # librosa は train/mel_processing.py の mel 変換行列のみのため、torchaudio への代替も
     # 検討の余地はあるが、フィルタバンクの数値が微妙に異なる（学習結果＝ゴールデン音声の
     # 契約が変わる）ため現状は維持。以下4つ（huggingface-hub/librosa/soundfile/tensorboard）は
-    # 学習・前処理専用だが、本リポジトリは「学習コア」として `uv sync`（エクストラ無し）で
+    # 学習・前処理専用だが、本リポジトリは「学習コア」として `uv sync`（追加指定なし）で
     # 全て揃うことを契約とするためコア依存のまま
     "librosa",
     "loguru",
     "numba",
     "num2words",
-    "numpy>=2",  # pyannote.audio 4.x（train エクストラ）が numpy>=2 を要求する。pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が提供されるためソースビルド不要
+    "numpy>=2",  # pyannote.audio 4.x（train グループ）が numpy>=2 を要求する。pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が提供されるためソースビルド不要
     "pydantic>=2.0",
     "pyopenjtalk-plus[onnxruntime,tsqyomi]",  # pyopenjtalk のドロップイン代替（import pyopenjtalk のまま）。onnxruntime は「何」読み推定用、tsqyomi は同形異音語の文脈読み選択用
     "pyworld-prebuilt",
@@ -49,16 +49,6 @@ dependencies = [
     "torchaudio>=2.4",
     "tqdm",
     "transformers",
-]
-
-[project.optional-dependencies]
-# 試聴 GUI（app.py / gradio_tabs）専用。コアライブラリ・学習パイプラインには不要
-gui = [
-    "gradio>=5.0",
-]
-# 学習・前処理チェーン専用（スタイル生成の pyannote.audio。numpy>=2 を要求されるため環境に注意）
-train = [
-    "pyannote.audio>=4.0.7",
 ]
 
 [project.urls]
@@ -84,12 +74,26 @@ source-include = [
 # torch 等は PyPI の CUDA ビルドがそのまま入る（必要なら cu12x index を使うこと）
 # pyopenjtalk-plus は numpy 2.x 向け事前ビルド済み wheel が全プラットフォーム向けに配布されており、
 # ソースビルド（cmake / cython>=3.1 制約）は不要になった
+# gui / train を extras でなく dependency-groups に置き既定でインストールする。
+# extras にすると `uv run` 側の自動 sync が「既定エクストラ＝無し」で環境を完全一致させるため、
+# 入れたはずの gradio / pyannote.audio を黙って除去した（dependency-groups は既定対象なので対象外）
+default-groups = ["dev", "gui", "train"]
 
 [dependency-groups]
+# 試聴 GUI（app.py / gradio_tabs）用。コアライブラリ・学習パイプライン自体は不要だが既定で入れる
+gui = [
+    "gradio>=5.0",
+]
+# スタイル生成（前処理 Step6、tts_model の音声からのスタイルベクトル推論）用。
+# pyannote.audio は numpy>=2 を要求されるため環境に注意
+train = [
+    "pyannote.audio>=4.0.7",
+]
 dev = [
     "black",
     "coverage[toml]>=6.5",
     "pytest",
+    "pyright",
     "ruff",
     "scipy",
 ]
@@ -115,4 +119,55 @@ exclude_lines = ["no cov", "if __name__ == .__main__.:", "if TYPE_CHECKING:"]
 select = ["E4", "E7", "E9", "F", "I", "UP"]
 
 [tool.ruff.lint.isort]
-lines-after-imports = 2
+# black 優先。この値を 2 にすると ruff I001 が black と正面衝突する（black は import 直後が
+# 通常コードなら1空行、def/class なら2空行と文脈依存で決めるため、固定値では両立不能）。
+# -1（既定）は black の出力をそのまま許容するので、ruff check と black --check が同時に通る
+lines-after-imports = -1
+
+[tool.pyright]
+# requires-python と揃える（これより新しい構文を許容しない）
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+# 型解決には gui / train グループ（gradio・pyannote.audio）が必要。既定グループに
+# 含まれるので `uv sync` だけで揃う。未インストールだと reportMissingImports が落ちる。
+# ※かつて extras に置いていたときは、`uv run` の自動 sync が既定エクストラ無しで
+#  環境を完全一致させ、gradio / pyopenjtalk-plus を黙って除去して破損した
+include = [
+    "app.py",
+    "gradio_tabs",
+    "preprocess",
+    "preprocess_all.py",
+    "style_bert_vits2",
+    "train",
+    "train_model.py",
+    "tests",
+]
+# 学習成果物・データセットは Python ソースではない（テストの model_assets は実行時に生成される）
+exclude = ["**/__pycache__", "Data", "model_assets", "pretrained", "tests/model_assets"]
+
+# ---- 導入時のベースライン ----
+# error にしているのは「当リポジトリで直せる型問題」だけ。以下を warning にするのは、
+# 実バグではなく型情報の限界が原因だと全件で確認できたため
+# （error のままだとノイズに埋もれて新規の実エラーが見えなくなる）。
+# 締める際は各コメントの該当箇所から順に error へ戻す。
+reportAttributeAccessIssue = "warning" # 残10件。DDP 展開の hasattr(model,"module") 展開が型詰められない（checkpoints.py / safetensors.py の 5件）、floss=0 初期化に対する .mean()/.backward()（losses.py:116、pipeline.py:836,855）、torch.hub.load の戻り値（select_best.py:105）
+reportCallIssue = "warning" # 残2件。torch スタブ起因。models_jp_extra.py:616 の layer.remove_weight_norm() 等が Tensor と解釈される
+
+[[tool.pyright.executionEnvironments]]
+root = "train"
+# 学習パイプラインは設計上これらを必要とするため train 配下だけ緩和する。
+# 判別器・writer・optimizer は機能オフ時に None のまま受け渡し、損失変数は
+# フラグガードの中で条件付き定義される（pipeline.py の学習ループ）
+reportPossiblyUnboundVariable = "warning"
+reportOptionalMemberAccess = "warning"
+reportArgumentType = "warning"
+reportOperatorIssue = "warning"
+
+[[tool.pyright.executionEnvironments]]
+root = "style_bert_vits2"
+# tts_model.py の style_vector_inference（未ロード時に None）と、transformers の
+# from_pretrained が Optional で返るための戻り値型ノイズ。実バグではないので導入時は warning
+reportOptionalMemberAccess = "warning"
+reportOptionalCall = "warning"
+reportReturnType = "warning"
+reportAssignmentType = "warning"

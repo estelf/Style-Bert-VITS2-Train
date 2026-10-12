@@ -15,6 +15,7 @@ from style_bert_vits2.models import commons
 from style_bert_vits2.models.hyper_parameters import HyperParametersData
 from style_bert_vits2.models.utils import load_filepaths_and_text, load_wav_to_torch
 from style_bert_vits2.nlp import cleaned_text_to_sequence
+from style_bert_vits2.utils.bert_cache import bert_feature_key, load_bert_feature
 from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 
 """Multi speaker version"""
@@ -83,14 +84,18 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         audiopaths_sid_text_new = []
         lengths = []
-        skipped = 0
+        skipped_paths: list[str] = []
         logger.info("Init dataset...")
         for _id, spk, language, text, phones, tone, word2ph in tqdm(
             self.audiopaths_sid_text, file=sys.stdout, dynamic_ncols=True
         ):
             audiopath = f"{_id}"
-            # if self.min_text_len <= len(phones) and len(phones) <= self.max_text_len:
             phones = phones.split(" ")
+            # 音素長の範囲外（空テキストや極端に長いテキスト）は学習に不適なので除外する。
+            # 以前はコメントアウトされており min_text_len / max_text_len が死んだ設定だった
+            if not self.min_text_len <= len(phones) <= self.max_text_len:
+                skipped_paths.append(audiopath)
+                continue
             tone = [int(i) for i in tone.split(" ")]
             word2ph = [int(i) for i in word2ph.split(" ")]
             audiopaths_sid_text_new.append(
@@ -98,8 +103,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             )
             # ヘッダ情報から正確なサンプル数を読み、center=False の STFT 出力フレーム数を再現する
             lengths.append(_spec_length(audiopath, self.filter_length, self.hop_length))
-            # else:
-            #     skipped += 1
+        skipped = len(skipped_paths)
+        if skipped > 0:
+            logger.warning(
+                f"{skipped} samples are outside the text length range [{self.min_text_len}, {self.max_text_len}] and will NOT be used for training. e.g.: {skipped_paths[:10]}"
+            )
         logger.info(
             "skipped: "
             + str(skipped)
@@ -183,26 +191,50 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 )
             spec = torch.squeeze(spec, 0)
             if self.spec_cache:
-                torch.save({"spec": spec, "stft_params": stft_params}, spec_filename)
+                # 原子的保存（tmp → rename）。DataLoader ワーカーが並列で同じキャッシュを
+                # 書くことはないが、書き込み中のクラッシュで壊れた .spec.pt が
+                # 以降の全エポックで黙って再計算扱いになるのを防ぐ
+                tmp_filename = f"{spec_filename}.tmp{os.getpid()}"
+                try:
+                    torch.save({"spec": spec, "stft_params": stft_params}, tmp_filename)
+                    os.replace(tmp_filename, spec_filename)
+                except BaseException:
+                    if os.path.exists(tmp_filename):
+                        os.remove(tmp_filename)
+                    raise
         return spec, audio_norm
 
     def get_text(self, text, word2ph, phone, tone, language_str, wav_path):
+        # BERTキャッシュの検証用ハッシュは train.list に書かれた生の word2ph から作る
+        # （preprocess/bert_gen.py と同じ規約）
+        bert_key = bert_feature_key(text, word2ph)
         phone, tone, language = cleaned_text_to_sequence(phone, tone)
         if self.add_blank:
             phone = commons.intersperse(phone, 0)
             tone = commons.intersperse(tone, 0)
             language = commons.intersperse(language, 0)
-            for i in range(len(word2ph)):
-                word2ph[i] = word2ph[i] * 2
-            word2ph[0] += 1
+            # 旧実装はここで word2ph を倍化（intersperse）していたが、ja_bert は bert_gen
+            # 時点で音素長へ展開済みで word2ph は戻り値に一切使われない死コードだった。
+            # かつ dataset が保持するリストを in-place で破壊するため、バケットの
+            # batch 倍数パディングで生じる重複サンプルを同じワーカーが2回読むと、
+            # 2回目のハッシュ計算が倍化済み word2ph で行われ誤 stale 検出になる
+            # （実データで再現）。不変性を保証するため削除した
         bert_path = str(Path(wav_path).with_suffix(".bert.pt"))
-        try:
-            ja_bert = torch.load(bert_path, weights_only=True)
-            assert ja_bert.shape[-1] == len(phone)
-        except Exception as e:
-            logger.warning("Bert load Failed")
-            logger.warning(e)
-            raise
+        ja_bert, stale = load_bert_feature(bert_path, bert_key)
+        if stale:
+            # esd.list のリテイクや dict_data/ 辞書更新で読みが変わったのに Step 5 が
+            # 再実行されていない。古い特徴で学習を続けると音素と BERT 特徴が食い違うため
+            # 学習続行は不可能（学習中に再生成できないので明示的に失敗させる）
+            raise ValueError(
+                f"BERT特徴 {bert_path} が古いです（テキストまたはユーザー辞書が変更されています）。"
+                "`uv run preprocess_all.py -m <モデル名>` で Step 5（bert_gen）を再実行してください"
+            )
+        if ja_bert is None:
+            logger.warning(f"Bert load Failed: {bert_path}")
+            raise ValueError(
+                f"BERT特徴 {bert_path} が読み込めません。Step 5（bert_gen）を再実行してください"
+            )
+        assert ja_bert.shape[-1] == len(phone)
         phone = torch.LongTensor(phone)
         tone = torch.LongTensor(tone)
         language = torch.LongTensor(language)
