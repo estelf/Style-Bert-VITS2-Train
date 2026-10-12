@@ -16,18 +16,36 @@ from style_bert_vits2.logging import logger
 _logger_handler = None
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """dict を再帰的にマージする（override 側を優先）。テンプレートに無いユーザー独自キーも残す"""
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def initialize(
     model_name: str,
-    batch_size: int,
-    epochs: int,
-    save_every_steps: int,
-    freeze_JP_bert: bool,
-    freeze_style: bool,
-    freeze_decoder: bool,
-    log_interval: int,
+    batch_size: int | None = None,
+    epochs: int | None = None,
+    save_every_steps: int | None = None,
+    freeze_JP_bert: bool | None = None,
+    freeze_style: bool | None = None,
+    freeze_decoder: bool | None = None,
+    log_interval: int | None = None,
     reset_models: bool = False,
 ) -> None:
     """Step 1: Data/<モデル名>/config.json をテンプレートから生成し、事前学習済みモデルを配置する。
+
+    既存 config.json がある場合はテンプレートに**既存値を重ねたもの**を base にする。
+    以前は毎回テンプレートから作り直していたため、learning_rate や early_stopping_* など
+    CLI 引数に対応しないキーの手動編集が黙って失われていた。CLI 引数に対応するキー
+    （batch_size / epochs / eval_interval / log_interval / freeze_*）は、引数が**明示された
+    ときだけ**上書きする（未指定なら既存値を尊重。freeze フラグは true を明示したときだけ
+    立ち上がり、false に戻すには config.json を直接編集する）
 
     Args:
         reset_models (bool): True の場合のみ既存の models/ をバックアップして事前学習モデルでリセットする。
@@ -53,20 +71,39 @@ def initialize(
     # CWD 依存を避けるため BASE_DIR 基準で解決する
     with open(BASE_DIR / "configs/config_jp_extra.json", encoding="utf-8") as f:
         config = json.load(f)
+    # 既存 config.json がある場合はテンプレートへ既存値を重ねる（新規キーはテンプレート既定、
+    # 既存キーはユーザー値を維持）。pydantic 側の既定値もあるので欠損キーは起動時に補われる
+    existing_path = dataset_path / "config.json"
+    if existing_path.is_file():
+        try:
+            existing = json.loads(existing_path.read_text(encoding="utf-8"))
+            config = _deep_merge(config, existing)
+            logger.info("Step 1: 既存 config.json の設定値を維持して更新します")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                f"Step 1: 既存 config.json の読み込みに失敗したためテンプレートから再生成します: {e}"
+            )
     config["model_name"] = model_name
     # config の version はモデルフォーマットの識別子（推論時の互換判定に使う）。
     # パッケージバージョン（pyproject.toml）から生成して手動同期を無くす
     config["version"] = f"{VERSION}-JP-Extra"
     config["data"]["training_files"] = str(dataset_path / "train.list")
     config["data"]["validation_files"] = str(dataset_path / "val.list")
-    config["train"]["batch_size"] = batch_size
-    config["train"]["epochs"] = epochs
-    config["train"]["eval_interval"] = save_every_steps
-    config["train"]["log_interval"] = log_interval
-
-    config["train"]["freeze_JP_bert"] = freeze_JP_bert
-    config["train"]["freeze_style"] = freeze_style
-    config["train"]["freeze_decoder"] = freeze_decoder
+    # CLI 引数が明示されたときだけ上書きする（None は既存/テンプレート値を尊重）
+    if batch_size is not None:
+        config["train"]["batch_size"] = batch_size
+    if epochs is not None:
+        config["train"]["epochs"] = epochs
+    if save_every_steps is not None:
+        config["train"]["eval_interval"] = save_every_steps
+    if log_interval is not None:
+        config["train"]["log_interval"] = log_interval
+    if freeze_JP_bert is not None:
+        config["train"]["freeze_JP_bert"] = freeze_JP_bert
+    if freeze_style is not None:
+        config["train"]["freeze_style"] = freeze_style
+    if freeze_decoder is not None:
+        config["train"]["freeze_decoder"] = freeze_decoder
 
     model_path = dataset_path / "models"
     if model_path.exists() and not reset_models:
@@ -116,7 +153,13 @@ def extract_raw(model_name: str) -> None:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            target = out_dir / info.filename
+            # path traversal 対策: 絶対パスや ".." を含むエントリは wavs/ の外へ
+            # 書き込めるため拒否する（悪意ある zip からのファイル上書きを防ぐ）
+            target = (out_dir / info.filename).resolve()
+            if not target.is_relative_to(out_dir.resolve()):
+                raise ValueError(
+                    f"Step 2: raw.zip のエントリ {info.filename!r} は wavs/ の外を指すため展開を中止します"
+                )
             data = zf.read(info)
             digest = hashlib.sha256(data).hexdigest()
             if manifest.get(info.filename) == digest and target.exists():
