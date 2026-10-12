@@ -6,7 +6,7 @@
 
 ```bash
 uv run tensorboard --logdir Data/<モデル名>/models
-# 例: uv run tensorboard --logdir Data/Kotori/models
+
 ```
 
 ブラウザで http://localhost:6006 を開きます。このディレクトリには `G_*.pth` などのチェックポイントも一緒にありますが、TensorBoard は `events.out.tfevents.*` ファイルだけを読みます。
@@ -49,6 +49,18 @@ uv run tensorboard --logdir Data/<モデル名>/models
 | `loss/wd/total` | SLM 判別器の合計損失 |
 | `loss/g/lm` / `loss/g/lm_gen` | SLM 特徴のマッチング誤差 / 偽物に対する生成器損失。低下傾向ならスタイル・韻律の学習が進んでいる |
 | `grad_norm_wd` | SLM 判別器の勾配ノルム |
+
+### 検証損失（早期停止の監視指標）
+
+`eval_interval` ごとに val.list（held-out 発話）で計算される非敵対損失。敵対損失と違い判別器の状態に依存しないので、**学習の進み・過学習の判定はこっちを見る**（train.list 側と発話が異なるため絶対値は train より高めに出る）。
+
+| タグ | 意味 |
+|---|---|
+| `val/mel` | 検証データのスペクトログラムL1誤差（c_mel 加重）。早期停止の既定監視対象 |
+| `val/dur` / `val/kl` | 検証データの音素長回帰誤差 / KL 正則化項 |
+| `val/total` | 上の3つの合計 |
+
+`val/mel` が train 側は下がり続けているのに横ばい・上昇に転じたら過学習の兆候。早期停止は既定で有効で、設定とプラトー検出は [GUIDE.md](GUIDE.md) の「早期停止と best checkpoint の自動選定」参照（履歴は `models/eval_history.json` にも残る）。
 
 ### 診断用
 

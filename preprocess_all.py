@@ -13,14 +13,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name", "-m", type=str, help="Model name", required=True
     )
-    parser.add_argument("--batch_size", "-b", type=int, help="Batch size", default=4)
-    parser.add_argument("--epochs", "-e", type=int, help="Epochs", default=100)
+    parser.add_argument(
+        "--batch_size",
+        "-b",
+        type=int,
+        help="Batch size（未指定なら既存 config.json の値を維持）",
+        default=None,
+    )
+    parser.add_argument(
+        "--epochs",
+        "-e",
+        type=int,
+        help="Epochs（打ち切り上限。早期停止が既定有効のため、収束すればこの前に自動停止する。未指定なら既存 config.json の値を維持）",
+        default=None,
+    )
     parser.add_argument(
         "--save_every_steps",
         "-s",
         type=int,
-        help="Save every steps",
-        default=1000,
+        help="Save every steps（未指定なら既存 config.json の値を維持）",
+        default=None,
     )
     parser.add_argument(
         "--num_processes",
@@ -30,13 +42,22 @@ if __name__ == "__main__":
         default=max(1, cpu_count() // 2),
     )
     parser.add_argument(
-        "--freeze_JP_bert", action="store_true", help="Freeze JP BERT", default=False
+        "--freeze_JP_bert",
+        action="store_true",
+        help="Freeze JP Bert（指定時のみ true。未指定なら既存 config.json の値を維持）",
+        default=None,
     )
     parser.add_argument(
-        "--freeze_style", action="store_true", help="Freeze style vector", default=False
+        "--freeze_style",
+        action="store_true",
+        help="Freeze style vector（指定時のみ true。未指定なら既存 config.json の値を維持）",
+        default=None,
     )
     parser.add_argument(
-        "--freeze_decoder", action="store_true", help="Freeze decoder", default=False
+        "--freeze_decoder",
+        action="store_true",
+        help="Freeze decoder（指定時のみ true。未指定なら既存 config.json の値を維持）",
+        default=None,
     )
     parser.add_argument(
         "--val_per_lang",
@@ -47,8 +68,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_interval",
         type=int,
-        help="Log interval",
-        default=200,
+        help="Log interval（未指定なら既存 config.json の値を維持）",
+        default=None,
     )
     parser.add_argument(
         "--yomi_error",

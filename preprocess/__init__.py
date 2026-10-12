@@ -70,7 +70,12 @@ def preprocess_text(model_name: str, val_per_lang: int, yomi_error: str) -> None
 
 
 def bert_gen(model_name: str) -> None:
-    """Step 5: BERT特徴ファイル（*.bert.pt）を生成する（重いのでプロセス数いじり不可）。
+    """Step 5: BERT特徴ファイル（*.bert.pt）を生成する。
+
+    既存キャッシュには生成根拠（テキスト＋word2ph）のハッシュを添えて保存し、有効な行は
+    読み飛ばす。再生成が必要な行だけを GPU バッチ forward で処理する（旧実装は全行を
+    1件ずつ forward していた）。辞書更新やリテイクで読みが変わった行は自動再生成される
+    （学習側 train/data_utils.py でもハッシュを照合し、不一致なら Step 5 再実行を要求して失敗する）。
 
     Raises:
         RuntimeError: BERT特徴ファイルの生成に失敗した場合
@@ -84,7 +89,11 @@ def bert_gen(model_name: str) -> None:
 
 
 def style_gen(model_name: str, num_processes: int) -> None:
-    """Step 6: スタイル特徴を生成し、style2id を config.json に書き込む（学習の後工程）。
+    """Step 6: 各音声のスタイル特徴（*.wav.npy）を生成する。
+
+    style2id / num_styles の config.json への書き込みはここではなく、学習開始時に
+    train/default_style.py（Neutral 1本化）が行う。既存 .npy がある音声はスキップされる
+    （音声の中身が変わった場合は Step 2 の extract_raw が古い .npy を削除する）
 
     Raises:
         RuntimeError: スタイル特徴ファイルの生成に失敗した場合
@@ -107,15 +116,17 @@ def style_gen(model_name: str, num_processes: int) -> None:
 
 def preprocess_all(
     model_name: str,
-    batch_size: int = 4,
-    epochs: int = 100,
-    save_every_steps: int = 1000,
+    batch_size: int | None = None,
+    epochs: (
+        int | None
+    ) = None,  # 打ち切り上限。早期停止（既定有効）が収束判定するため、到達しないことがある
+    save_every_steps: int | None = None,
     num_processes: int = 2,
-    freeze_JP_bert: bool = False,
-    freeze_style: bool = False,
-    freeze_decoder: bool = False,
+    freeze_JP_bert: bool | None = None,
+    freeze_style: bool | None = None,
+    freeze_decoder: bool | None = None,
     val_per_lang: int = 4,  # 話者ごとの検証データ数（上流既定の4。0 で無効化）
-    log_interval: int = 200,
+    log_interval: int | None = None,
     yomi_error: str = "raise",
     reset_models: bool = False,
 ) -> None:
@@ -123,6 +134,9 @@ def preprocess_all(
 
     Args:
         model_name (str): データセット名（Data/<モデル名> を使う・作る）
+        batch_size / epochs / save_every_steps / log_interval / freeze_*: 既存 config.json の
+            対応キーへ書き込む値。None（既定）は既存値・テンプレート既定を尊重する
+            （再実行で手動編集が失われないようにするため）
         reset_models (bool): True の場合のみ models/ をバックアップして事前学習モデルでリセットする。既定では既存チェックポイントを上書きしない
         yomi_error (str): 読み上げエラー時の挙動。Options: raise, skip, use
 

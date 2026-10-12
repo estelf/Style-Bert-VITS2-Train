@@ -2,6 +2,7 @@ import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,11 @@ def _get_inference():
     from pyannote.audio import Inference, Model
 
     model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM")
+    if model is None:
+        raise RuntimeError(
+            "pyannote/wespeaker-voxceleb-resnet34-LM を読み込めませんでした。"
+            "Hugging Face 側でモデルの利用条件に同意し、トークンを設定しているか確認してください。"
+        )
     inference = Inference(model, window="whole")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return inference.to(device)
@@ -51,6 +57,11 @@ def save_style_vector(wav_path: str):
 
 def process_line(line: str):
     wav_path = line.split("|")[0]
+    # 既存の .npy はスキップする（増分実行）。前回 NaN で除外された行は train.list/val.list
+    # 自体から削除済みなので再処理されない。音声の中身が変わった場合は
+    # preprocess.initialize.extract_raw が古い .npy を削除するため、自動的に再生成される
+    if Path(f"{wav_path}.npy").is_file():
+        return line, None
     try:
         save_style_vector(wav_path)
         return line, None
