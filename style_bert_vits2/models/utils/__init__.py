@@ -100,11 +100,12 @@ def load_filepaths_and_text(filename: str | Path, split: str = "|") -> list[list
         split (str): ファイルの区切り文字 (デフォルト: "|")
 
     Returns:
-        list[list[str]]: ファイルパスとテキストのリスト
+        list[list[str]]: ファイルパスとテキストのリスト（空行は読み飛ばす。
+            train.list / val.list の途中に空行があると unpack 例外で学習が落ちるため）
     """
 
     with open(filename, encoding="utf-8") as f:
-        filepaths_and_text = [line.strip().split(split) for line in f]
+        filepaths_and_text = [line.strip().split(split) for line in f if line.strip()]
     return filepaths_and_text
 
 

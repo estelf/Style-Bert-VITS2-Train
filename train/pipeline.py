@@ -1,10 +1,15 @@
 import argparse
 import datetime
 import gc
+import hashlib
+import json
 import os
 import platform
+import re
+import shutil
 import socket
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -63,11 +68,195 @@ torch.backends.cuda.enable_mem_efficient_sdp(
 # 決定論モード（デフォルト OFF）。回帰テストのゴールデン音声比較時のみ環境変数 SBV2_DETERMINISTIC=1 で有効化する。
 # 本番の長時間学習では cuDNN の非決定的最適カーネルが使えるほうが速いため、常時 ON にしない。
 # CUBLAS_WORKSPACE_CONFIG は cuBLAS ハンドル生成時に読まれるため、CUDA 呼び出しより前のモジュール先頭で設定する。
+# warn_only=True: 決定論カーネルが無い op は警告だけ出して従来カーネルで走る。torch バージョン更新で
+# 新規 op が非決定扱いになるとき、学習・テスト自体が RuntimeError で止まらないため（回帰テストは
+# 相関ベースの差分検知なので、警告レベルの非決定性までは要求しない）
 DETERMINISTIC = os.environ.get("SBV2_DETERMINISTIC", "0") == "1"
 if DETERMINISTIC:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 global_step = 0
+
+# 検証損失の履歴（eval_history.json と同期。早期停止の判定に使う。global_step と同じく
+# モジュールレベルの状態として扱うのがこのファイルの既存パターン）
+_eval_history: list[dict] = []
+
+# 今回の val.list のハッシュ（早期停止履歴の検証セット同一性判定用。run() で設定）
+_val_hash: str | None = None
+
+# 生成器の EMA 状態（パラメータ名 → float32 テンソル）。ema_decay > 0 のとき rank 0 だけが保持する
+_ema_state: dict[str, torch.Tensor] | None = None
+
+# 非有限損失（NaN/inf）の連続スキップ回数。閾値超過で学習停止（全ランク同期で判定する）
+_nan_skip_count = 0
+
+# best.safetensors へコピー済みの best step（同じ best のたびに ~120MB コピーし直さないため）
+_best_copied_step: int | None = None
+
+
+def _free_port() -> str:
+    """空きポートを選ぶ（既定ポート固定だと同時実行する2本目が衝突するため）"""
+    try:
+        family, bind_addr = socket.AF_INET6, "::1"
+        socket.socket(family, socket.SOCK_STREAM).close()
+    except OSError:  # IPv6 無効環境では IPv4 ループバックで代替
+        family, bind_addr = socket.AF_INET, "127.0.0.1"
+    with socket.socket(family, socket.SOCK_STREAM) as s:
+        s.bind((bind_addr, 0))
+        return str(s.getsockname()[1])
+
+
+def _val_list_hash(path: str) -> str | None:
+    """val.list の内容ハッシュ。中身が変わったら早期停止履歴の比較可能性が失われることの検出に使う"""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _validate_train_config(hps) -> None:
+    """学習開始前に config.json の train 設定を検証する（実行途中で ZeroDivisionError 等になるのを防ぐ）"""
+    t = hps.train
+    if t.log_interval <= 0:
+        raise ValueError(
+            f"train.log_interval は 1 以上が必要です（現在: {t.log_interval}）"
+        )
+    if t.eval_interval <= 0:
+        raise ValueError(
+            f"train.eval_interval は 1 以上が必要です（現在: {t.eval_interval}）"
+        )
+    if t.accumulation_steps < 1:
+        raise ValueError(
+            f"train.accumulation_steps は 1 以上が必要です（現在: {t.accumulation_steps}）"
+        )
+    if t.warmup_epochs < 0:
+        raise ValueError(
+            f"train.warmup_epochs は 0 以上が必要です（現在: {t.warmup_epochs}）"
+        )
+    if not (t.ema_decay == 0 or 0 < t.ema_decay < 1):
+        raise ValueError(
+            f"train.ema_decay は 0（無効）または 0〜1 の実数が必要です（現在: {t.ema_decay}）"
+        )
+    if t.early_stopping_monitor not in ("mel", "dur", "kl", "total"):
+        logger.warning(
+            f"early_stopping_monitor='{t.early_stopping_monitor}' は不明です。'mel' に正規化します"
+        )
+        t.early_stopping_monitor = "mel"
+
+
+def _all_ranks_finite(losses: list[torch.Tensor], device) -> bool:
+    """損失が全ランク・全要素で有限かを判定する。
+
+    NaN ガードの分岐はランク間で必ず同じ判定にしないと、あるランクだけ backward を
+    飛ばして DDP の集合通信が不一致になりハングする。そのため GPU 上のフラグを
+    all_reduce で集約してから .item() で同期する（1ステップ1回の同期は許容）
+    """
+    bad = torch.zeros((), dtype=torch.int32, device=device)
+    for loss in losses:
+        bad += (~torch.isfinite(loss.detach())).to(torch.int32).sum()
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(bad)
+    return bad.item() == 0
+
+
+def _zero_loss(loss: torch.Tensor) -> torch.Tensor:
+    """非有限損失を backward 可能なゼロに置き換える。
+
+    単純に backward を飛ばすと DDP の Reducer が「前回の backward が未完」で次回
+    forward に失敗するため、計算グラフは保ったまま値と勾配だけがゼロになるよう
+    nan_to_num 後に 0 倍する（detach しないこと。グラフは必要）。
+    forward 中間値自体が NaN の場合 backward で NaN 勾配が再発しうるが、
+    optim.step() を呼ばず zero_grad で破棄するため重みは汚染されない
+    """
+    return torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0) * 0.0
+
+
+def _safetensors_step(path: Path) -> int:
+    """<モデル名>_e<epoch>_s<step>[_ema].safetensors から step を取り出す（取れなければ -1）"""
+    m = re.search(r"_s(\d+)(?:_ema)?\.safetensors$", path.name)
+    return int(m.group(1)) if m else -1
+
+
+def _clean_safetensors(
+    assets_dir: str | Path, keep: int, best_step: int | None = None
+) -> None:
+    """model_assets/ 配下の .safetensors を step 単位で keep 個に絞る（0 で全残し）。
+
+    best.safetensors（推論に使うべき1点のコピー）・best_step のファイル・step を解釈
+    できないファイルは削除対象から除外する。早期停止の監視 best とは別に、合成品質評価
+    select_best.py の候補として全残しにしてきたが、eval_interval=1000 の長期学習で数百個
+    溜まり disk を圧迫するため、保持上限を設定できるようにした
+    """
+    if keep <= 0:
+        return
+    files = [
+        p
+        for p in Path(assets_dir).glob("*.safetensors")
+        # best.safetensors（推論用1点コピー）と step を解釈できないファイルは削除しない
+        if p.name != "best.safetensors" and _safetensors_step(p) >= 0
+    ]
+    steps = sorted({_safetensors_step(p) for p in files}, reverse=True)
+    keep_steps = set(steps[:keep])
+    if best_step is not None:
+        keep_steps.add(best_step)
+    for p in files:
+        if _safetensors_step(p) not in keep_steps:
+            try:
+                p.unlink()
+                logger.info(f"Free up space by deleting safetensors {p.name}")
+            except OSError as e:
+                logger.warning(f"{p.name} の削除に失敗しました: {e}")
+
+
+def _filter_eval_dataset(eval_dataset, min_frames: int, max_frames: int) -> int:
+    """評価データセットから [min_frames, max_frames]（spec フレーム数）外のサンプルを in-place で除外し、件数を返す。
+
+    学習のバケット除外（DistributedBucketSampler の boundaries [32, 1000]）と同じ基準。
+    長尺サンプルが評価に残っていると evaluate() の infer(max_len=1000) で生成音声だけが
+    約 11.6 秒に打ち切られ、フル長の gt/audio_ と比較できない（TensorBoard の音声プレビューが
+    意味をなさない）。また早期停止の val 損失に学習で一切使われないサンプルが混ざらないようにする
+    """
+    keep_entries, keep_lengths = [], []
+    for entry, length in zip(eval_dataset.audiopaths_sid_text, eval_dataset.lengths):
+        if min_frames <= length <= max_frames:
+            keep_entries.append(entry)
+            keep_lengths.append(length)
+    dropped = len(eval_dataset.audiopaths_sid_text) - len(keep_entries)
+    if dropped > 0:
+        eval_dataset.audiopaths_sid_text = keep_entries
+        eval_dataset.lengths = keep_lengths
+    return dropped
+
+
+def _ema_update(net_g, decay: float) -> None:
+    """生成器パラメータの EMA を更新する（rank 0 のみが _ema_state を持つ）"""
+    if _ema_state is None:
+        return
+    module = getattr(net_g, "module", net_g)
+    with torch.no_grad():
+        for name, p in module.named_parameters():
+            _ema_state[name].mul_(decay).add_(p.detach().float(), alpha=1.0 - decay)
+
+
+def _save_ema_safetensors(net_g, epoch: int, path: str) -> None:
+    """EMA 重みを一時ロードして _ema.safetensors として保存し、直後に元重みへ戻す。
+
+    学習継続に EMA の影響を与えないため、保存の一瞬だけ重みを差し替える。
+    推論・select_best.py 評価では通常の .safetensors と並ぶ候補になる
+    """
+    if _ema_state is None:
+        return
+    module = getattr(net_g, "module", net_g)
+    backup = {n: p.detach().clone() for n, p in module.named_parameters()}
+    try:
+        with torch.no_grad():
+            for n, p in module.named_parameters():
+                p.copy_(_ema_state[n].to(p.dtype))
+        utils.safetensors.save_safetensors(module, epoch, path, for_infer=True)
+    finally:
+        with torch.no_grad():
+            for n, p in module.named_parameters():
+                p.copy_(backup[n])
 
 
 def run():
@@ -100,6 +289,11 @@ def run():
         action="store_true",
         help="オプション: wavs/ のサブディレクトリごとにスタイルベクトルを生成する（既定は Neutral 1本のみ。フォルダ分けしていても使われない）。Neutral でも十分高い精度が出るため通常は不要",
     )
+    parser.add_argument(
+        "--allow_scratch",
+        action="store_true",
+        help="オプション: 再開時のチェックポイント読み込み失敗（破損・config 不一致など）でもスクラッチ学習へフォールバックする。既定は失敗時に停止して学習成果物の消失を防ぐ",
+    )
     args = parser.parse_args()
 
     # 学習対象のパスはモデル名から一意に定まる（状態管理なし・冪等）
@@ -119,17 +313,11 @@ def run():
 
     # Parsing environment variables (デフォルトは定数。環境変数が既に設定されている場合はそれを優先)
     envs = dict(TRAIN_ENV_DEFAULTS)
-    if "MASTER_PORT" not in os.environ:
-        # 既定ポートの固定値は同時実行する2本目が衝突するため、未設定のときだけ空きポートを選ぶ
-        # （torchrun 経由なら MASTER_PORT はランチャー側で設定されるのでここは通らない）
-        try:
-            family, bind_addr = socket.AF_INET6, "::1"
-            socket.socket(family, socket.SOCK_STREAM).close()
-        except OSError:  # IPv6 無効環境では IPv4 ループバックで代替
-            family, bind_addr = socket.AF_INET, "127.0.0.1"
-        with socket.socket(family, socket.SOCK_STREAM) as s:
-            s.bind((bind_addr, 0))
-            envs["MASTER_PORT"] = str(s.getsockname()[1])
+    # 既定ポートの固定値は同時実行する2本目が衝突するため、未設定のときだけ空きポートを選ぶ
+    # （torchrun 経由なら MASTER_PORT はランチャー側で設定されるのでここは通らない）
+    picked_port = "MASTER_PORT" not in os.environ
+    if picked_port:
+        envs["MASTER_PORT"] = _free_port()
     for env_name, env_value in envs.items():
         if env_name not in os.environ.keys():
             logger.info(f"Loading configuration from config {env_value!s}")
@@ -147,14 +335,34 @@ def run():
     backend = "nccl"
     if platform.system() == "Windows":
         backend = "gloo"  # If Windows,switch to gloo backend.
-    dist.init_process_group(
-        backend=backend,
-        init_method="env://",
-        timeout=datetime.timedelta(seconds=300),
-    )  # Use torchrun instead of mp.spawn
+    # timeout: 評価ステップでは rank 0 だけが検証音声の生成＋チェックポイント4点保存を行い、
+    # 他ランクは次の集合通信で待つ。検証文が多い・ディスクが遅い環境では 300 秒では足りず、
+    # 学習中盤で NCCL タイムアウト落ちするため 30 分に拡大する
+    world_size_env = int(os.environ.get("WORLD_SIZE", TRAIN_ENV_DEFAULTS["WORLD_SIZE"]))
+    for attempt in range(3):
+        try:
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+                timeout=datetime.timedelta(seconds=1800),
+            )  # Use torchrun instead of mp.spawn
+            break
+        except Exception as e:
+            # 空きポート選択には close してから bind までの TOCTOU の窓がある。
+            # 自前でポートを選んだ単一プロセス起動でのみ再試行して解消する
+            # （torchrun 経由や複数ランクでは他ランクが旧ポートを待ち続けるので再試行できない）
+            if not (picked_port and world_size_env == 1) or attempt == 2:
+                raise
+            logger.warning(
+                f"MASTER_PORT {os.environ['MASTER_PORT']} の待ち受けに失敗しました ({e})。空きポートで再試行します"
+            )
+            os.environ["MASTER_PORT"] = _free_port()
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     n_gpus = dist.get_world_size()
+    # NCCL の最初の集合通信（スタイル生成後の barrier）より前にデバイスを確定させる。
+    # 後回しだと全ランクがデフォルトの cuda:0 で communicator を作ろうとして失敗・ハングする
+    torch.cuda.set_device(local_rank)
 
     hps = HyperParameters.load_from_json(config_path)
     # This is needed because we have to pass values to `train_and_evaluate()
@@ -163,7 +371,12 @@ def run():
     hps.out_dir = out_dir
     hps.dataset_path = dataset_path
     hps.speedup = args.speedup
+    _validate_train_config(hps)
     os.makedirs(out_dir, exist_ok=True)
+
+    # val.list の内容ハッシュ（早期停止履歴が別の検証セット上の損失と混ざらないようにする）
+    global _val_hash
+    _val_hash = _val_list_hash(hps.data.validation_files)
 
     # 再開時は推論資産（config.json + style_vectors.npy）が既に揃っているのでスタイル生成は自動でスキップする（CLI指定不要）
     # マルチGPUでは全ランクが同じ style_vectors.npy / config.json を同時に書かないよう rank 0 のみ実行し、他ランクは完了を待つ
@@ -194,10 +407,11 @@ def run():
 
     torch.manual_seed(hps.train.seed)
     # シード固定だけでは消せない演算カーネルレベルの非決定性を潰す（回帰テストのゴールデン比較の前提）。
-    # 決定論カーネルは遅いため、環境変数 SBV2_DETERMINISTIC=1 のときのみ有効化する（本番学習は既定 OFF）
+    # 決定論カーネルは遅いため、環境変数 SBV2_DETERMINISTIC=1 のときのみ有効化する（本番学習は既定 OFF）。
+    # warn_only=True にし、決定論カーネルが無い op でも例外で止めない（torch 更新耐性。前述の通り
+    # 回帰テストは相関ベースの差分検知なのでビット単位一致は要求しない）
     if DETERMINISTIC:
-        torch.use_deterministic_algorithms(True)
-    torch.cuda.set_device(local_rank)
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     global global_step
     writer = None
@@ -234,6 +448,30 @@ def run():
             # prefetch_factor=6,
         )
     else:
+        # この経路は長さによる除外をしないため、segment_size 未満（既定 32 フレーム）の音声だと
+        # commons.slice_segments の torch.gather がインデックス範囲外でクラッシュする。
+        # check_dataset（Step 3）は範囲外を警告のみで通すため、ここで明示的に除外する
+        # （カスタムバッチサンプラー経路ではバケット境界外のサンプルは黙って除外される）
+        min_frames = hps.train.segment_size // hps.data.hop_length
+        short_indices = {
+            i for i, length in enumerate(train_dataset.lengths) if length < min_frames
+        }
+        if short_indices:
+            logger.warning(
+                f"{len(short_indices)} samples are shorter than segment_size ({min_frames} spec frames) "
+                "and would crash slice_segments. They are excluded from training "
+                "(--not_use_custom_batch_sampler path)."
+            )
+            train_dataset.audiopaths_sid_text = [
+                x
+                for i, x in enumerate(train_dataset.audiopaths_sid_text)
+                if i not in short_indices
+            ]
+            train_dataset.lengths = [
+                length
+                for i, length in enumerate(train_dataset.lengths)
+                if i not in short_indices
+            ]
         train_sampler = DistributedLengthGroupedSampler(
             dataset=train_dataset,
             batch_size=hps.train.batch_size,
@@ -256,7 +494,7 @@ def run():
             # prefetch_factor=6,
         )
         # この経路は長さによる除外をしないため、32フレーム未満の音声だと commons.slice_segments の
-        # torch.gather がインデックス範囲外になる。前処理 Step 3（check_dataset）で尺の範囲を検証している
+        # torch.gather がインデックス範囲外になる。上の除外フィルタで防ぐ
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
         logger.debug(f"len(train_loader): {len(train_loader)}")
@@ -267,6 +505,15 @@ def run():
         eval_dataset = TextAudioSpeakerLoader(
             hps.data.validation_files, hps.data, spec_cache=hps.train.spec_cache
         )
+        # 評価も学習バケット [32, 1000] フレームと同じ基準で除外する。長尺サンプルが
+        # 残ると TensorBoard の音声プレビューで生成だけが max_len=1000 に打ち切られ、
+        # フル長の gt と比較できない（早期停止の val 損失から学習不能サンプルを外す意味もある）
+        n_eval_dropped = _filter_eval_dataset(eval_dataset, 32, 1000)
+        if n_eval_dropped > 0:
+            logger.warning(
+                f"val.list のうち {n_eval_dropped} 件が評価バケット範囲 [32, 1000] フレーム外のため"
+                "評価から除外します（生成音声が max_len=1000 で打ち切られ gt と比較できないため）"
+            )
         eval_loader = DataLoader(
             eval_dataset,
             num_workers=0,
@@ -276,6 +523,18 @@ def run():
             drop_last=False,
             collate_fn=collate_fn,
         )
+    # 早期停止は val.list の検証損失で判定するため、検証データが無い・評価を無効化している
+    # 状態では黙って機能せず、epochs 上限（既定 1000）まで走る。暴走に見えないよう開始時に警告する
+    if rank == 0 and hps.train.early_stopping_enabled:
+        if args.speedup:
+            logger.warning(
+                "--speedup のため評価を行わず、早期停止は無効になります（epochs 上限まで学習します）"
+            )
+        elif eval_dataset is None or len(eval_dataset) == 0:
+            logger.warning(
+                f"val.list が空のため早期停止は機能しません（epochs 上限 {hps.train.epochs} まで学習します）。"
+                "検証データを置くか、early_stopping_enabled: false を明示してください"
+            )
     if hps.model.use_noise_scaled_mas is True:
         logger.info("Using noise scaled MAS for VITS2")
         mas_noise_scale_initial = 0.01
@@ -478,9 +737,20 @@ def run():
                 f"******************Found the model. Current epoch is {epoch_str}, gloabl step is {global_step}*********************"
             )
         except Exception as e:
+            # 再開失敗を握り潰してスクラッチ続行すると、keep_ckpts=1（既定）では次の保存後の
+            # clean_checkpoints が旧チェックポイントを削除し、学習の進捗が失われる。
+            # checkpoints.py の MAX_MISMATCHED_KEYS ガードの意図（大規模不一致を黙って通さない）
+            # を機能させるため、既定では停止し、明示的な --allow_scratch のときだけフォールバックする
+            if not args.allow_scratch:
+                raise RuntimeError(
+                    f"チェックポイントからの再開に失敗したため学習を開始できません: {e}。"
+                    "config.json（n_speakers / freeze_* など）と既存モデルの組み合わせを確認するか、"
+                    "意図的にスクラッチ学習へ切り替える場合は --allow_scratch を指定してください"
+                    "（続行すると旧チェックポイントが削除されるおそれがあります）"
+                ) from e
             logger.warning(e)
             logger.warning(
-                "It seems that you are not using the pretrained models, so we will train from scratch."
+                "--allow_scratch が指定されているため、スクラッチ学習にフォールバックします。"
             )
             epoch_str = 1
             global_step = 0
@@ -502,6 +772,14 @@ def run():
                 )
             logger.info("Loaded the pretrained models.")
         except Exception as e:
+            if Path(model_dir, "G_0.safetensors").is_file() and not args.allow_scratch:
+                # 事前学習モデルは存在するのに読み込みに失敗した（破損・不整合など）。
+                # ランダム初期化で黙って続行すると、壊れた土台で学習が進み、
+                # そのことに誰も気づかないままチェックポイントが上書きされていく
+                raise RuntimeError(
+                    f"事前学習モデル {os.path.join(model_dir, 'G_0.safetensors')} の読み込みに失敗しました: {e}。"
+                    "ファイルを復元するか、意図的にランダム初期化で学習する場合は --allow_scratch を指定してください"
+                ) from e
             logger.warning(e)
             logger.warning(
                 "It seems that you are not using the pretrained models, so we will train from scratch."
@@ -559,11 +837,13 @@ def run():
     diff = abs(
         epoch_str * len(train_loader) - (hps.train.epochs + 1) * len(train_loader)
     )
-    # 進捗バーは rank 0 のみ（他ランクで同じバーを出しても意味がない）
+    # 進捗バーは rank 0 のみ（他ランクで同じバーを出しても意味がない）。
+    # 早期停止が有効な場合 epochs は到達保証のない上限にすぎないので、バーは総数なし
+    # （経過step・レートのみ）にして、%/上限で収束を誤解させない
     pbar = None
     if rank == 0 and not args.no_progress_bar:
         pbar = tqdm(
-            total=global_step + diff,
+            total=None if hps.train.early_stopping_enabled else global_step + diff,
             initial=global_step,
             smoothing=0.05,
             file=sys.stdout,
@@ -571,13 +851,62 @@ def run():
         )
     initial_step = global_step
 
+    # 検証損失履歴を読み込む（再開時も履歴をまたいで早期停止を判定するため。書き込むのは rank 0 のみ）。
+    # val.list の内容ハッシュ付きで保存しており、別検証セット上の損失を best 判定に混ぜない
+    _eval_history.clear()
+    history_path = Path(model_dir) / "eval_history.json"
+    if rank == 0 and history_path.is_file():
+        try:
+            entries = json.loads(history_path.read_text(encoding="utf-8"))
+            kept, dropped, legacy = [], 0, 0
+            for entry in entries:
+                entry_hash = entry.get("val_hash")
+                if entry_hash is None:
+                    # ハッシュ導入以前の履歴。検証セットが変わったか判定できないため
+                    # 一応残す（best 情報を黙って失うほうが害が大きい）が、変更していれば再学習推奨
+                    legacy += 1
+                    kept.append(entry)
+                elif entry_hash == _val_hash:
+                    kept.append(entry)
+                else:
+                    dropped += 1
+            _eval_history.extend(kept)
+            if dropped > 0:
+                logger.warning(
+                    f"val.list が変更されているため、別検証セット上の損失である履歴 {dropped} 件を早期停止判定から除外しました"
+                )
+            if legacy > 0:
+                logger.warning(
+                    f"検証セット情報のない旧形式の履歴 {legacy} 件はそのまま採用します。val.list を変更した覚えがあれば eval_history.json を削除してください"
+                )
+            logger.info(
+                f"Loaded {len(_eval_history)} validation history entries from {history_path}"
+            )
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                f"eval_history.json の読み込みに失敗したため空履歴で開始します: {e}"
+            )
+
+    # 生成器の EMA（ema_decay > 0 のときのみ）。パラメータは DDP でランク間同期されるため、
+    # 更新・保持は rank 0 だけでよい（保存も rank 0 のみ）
+    global _ema_state
+    _ema_state = None
+    if hps.train.ema_decay > 0 and rank == 0:
+        _ema_state = {
+            name: p.detach().float().clone()
+            for name, p in net_g.module.named_parameters()
+        }
+        logger.info(
+            f"EMA を有効化しました (decay={hps.train.ema_decay})。評価保存時に _ema.safetensors も併記します"
+        )
+
     # 学習中に例外で抜けてもプロセスグループと進捗バーを確実に閉じる
     try:
         for epoch in range(epoch_str, hps.train.epochs + 1):
             # エポックごとにバッチ構成・順序を変える（self.epoch は set_epoch で初めて反映される）
             train_sampler.set_epoch(epoch)
             if rank == 0:
-                train_and_evaluate(
+                should_stop = train_and_evaluate(
                     rank,
                     local_rank,
                     epoch,
@@ -592,7 +921,7 @@ def run():
                     initial_step,
                 )
             else:
-                train_and_evaluate(
+                should_stop = train_and_evaluate(
                     rank,
                     local_rank,
                     epoch,
@@ -612,54 +941,86 @@ def run():
                 scheduler_dur_disc.step()
             if net_wd is not None:
                 scheduler_wd.step()
+            if should_stop:
+                # 早期停止発動。チェックポイント・safetensors は評価ステップで保存済み。
+                # 残る .pth は停止step（再開用）なので、推論に使うべき best を再掲する
+                best = _best_eval_entry(_eval_history, hps, initial_step)
+                logger.info(
+                    f"====> Early stopping: epoch {epoch} / global_step {global_step} で学習を停止します"
+                    + ("" if best is None else _best_summary(hps, best[0], best[1]))
+                )
+                break
             if epoch == hps.train.epochs:
-                # Save the final models
-                assert optim_g is not None
-                utils.checkpoints.save_checkpoint(
-                    net_g,
-                    optim_g,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(model_dir, f"G_{global_step}.pth"),
-                )
-                assert optim_d is not None
-                utils.checkpoints.save_checkpoint(
-                    net_d,
-                    optim_d,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(model_dir, f"D_{global_step}.pth"),
-                )
-                if net_dur_disc is not None:
-                    assert optim_dur_disc is not None
+                # Save the final models（保存は rank 0 のみ。他ランクが同時に同じ .pth へ
+                # 書くと競合して壊れる。評価ステップの保存は元々 rank 0 ガード付き）
+                if rank == 0:
+                    assert optim_g is not None
                     utils.checkpoints.save_checkpoint(
-                        net_dur_disc,
-                        optim_dur_disc,
+                        net_g,
+                        optim_g,
                         hps.train.learning_rate,
                         epoch,
-                        os.path.join(model_dir, f"DUR_{global_step}.pth"),
+                        os.path.join(model_dir, f"G_{global_step}.pth"),
                     )
-                if net_wd is not None:
-                    assert optim_wd is not None
+                    assert optim_d is not None
                     utils.checkpoints.save_checkpoint(
-                        net_wd,
-                        optim_wd,
+                        net_d,
+                        optim_d,
                         hps.train.learning_rate,
                         epoch,
-                        os.path.join(model_dir, f"WD_{global_step}.pth"),
+                        os.path.join(model_dir, f"D_{global_step}.pth"),
                     )
-                utils.safetensors.save_safetensors(
-                    net_g,
-                    epoch,
-                    os.path.join(
+                    if net_dur_disc is not None:
+                        assert optim_dur_disc is not None
+                        utils.checkpoints.save_checkpoint(
+                            net_dur_disc,
+                            optim_dur_disc,
+                            hps.train.learning_rate,
+                            epoch,
+                            os.path.join(model_dir, f"DUR_{global_step}.pth"),
+                        )
+                    if net_wd is not None:
+                        assert optim_wd is not None
+                        utils.checkpoints.save_checkpoint(
+                            net_wd,
+                            optim_wd,
+                            hps.train.learning_rate,
+                            epoch,
+                            os.path.join(model_dir, f"WD_{global_step}.pth"),
+                        )
+                    final_safetensors = os.path.join(
                         out_dir,
                         f"{model_name}_e{epoch}_s{global_step}.safetensors",
-                    ),
-                    for_infer=True,
-                )
+                    )
+                    utils.safetensors.save_safetensors(
+                        net_g, epoch, final_safetensors, for_infer=True
+                    )
+                    if _ema_state is not None:
+                        _save_ema_safetensors(
+                            net_g,
+                            epoch,
+                            final_safetensors.replace(
+                                ".safetensors", "_ema.safetensors"
+                            ),
+                        )
+                    # 最終保存でも best 記録を最新化してから、keep_safetensors 上限で
+                    # 古い eval 資産を整理する（best の step は必ず残す）
+                    best = _best_eval_entry(_eval_history, hps, initial_step)
+                    if best is not None:
+                        _save_best_checkpoint(hps, best[0], best[1])
+                    _clean_safetensors(
+                        out_dir,
+                        hps.train.keep_safetensors,
+                        best_step=None if best is None else best[0]["step"],
+                    )
     finally:
         if pbar is not None:
             pbar.close()
+        # TensorBoard のイベントファイルは close するまでバッファに残いうるため、
+        # 正常終了・例外終了を問わず閉じる（学習ログの末尾欠落防止）
+        if writer is not None:
+            writer.close()
+            writer_eval.close()
         dist.destroy_process_group()
 
 
@@ -684,7 +1045,10 @@ def train_and_evaluate(
     if writers is not None:
         writer, writer_eval = writers
 
-    global global_step
+    global global_step, _nan_skip_count
+
+    # 早期停止の判定結果（rank 0 が評価ステップで設定し、他ランクへブロードキャストで同期する）
+    early_stop_requested = False
 
     net_g.train()
     net_d.train()
@@ -705,302 +1069,487 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
-        if net_g.module.use_noise_scaled_mas:
-            current_mas_noise_scale = (
-                net_g.module.mas_noise_scale_initial
-                - net_g.module.noise_scale_delta * global_step
-            )
-            net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
-        x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
-            local_rank, non_blocking=True
+        # 勾配累積（accumulation_steps > 1 のとき有効）。更新マイクロバッチ以外は
+        # DDP の勾配 all_reduce を no_sync で省略し、is_opt_step の backward だけで
+        # 同期する（中間ステップの集合通信コストを払わない）。既定 1 では常に
+        # is_opt_step=True で従来動作と完全に一致する
+        accumulation_steps = hps.train.accumulation_steps
+        is_opt_step = (batch_idx + 1) % accumulation_steps == 0 or (
+            batch_idx + 1 == len(train_loader)  # エポック末尾の端数も必ず更新する
         )
-        spec, spec_lengths = spec.cuda(
-            local_rank, non_blocking=True
-        ), spec_lengths.cuda(local_rank, non_blocking=True)
-        y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
-            local_rank, non_blocking=True
-        )
-        speakers = speakers.cuda(local_rank, non_blocking=True)
-        tone = tone.cuda(local_rank, non_blocking=True)
-        language = language.cuda(local_rank, non_blocking=True)
-        bert = bert.cuda(local_rank, non_blocking=True)
-        style_vec = style_vec.cuda(local_rank, non_blocking=True)
-
-        # 勾配ノルムはログ出力ステップ（rank 0 のみ）だけ計算する（clip_grad_value_(..., None) はクリップせず毎回全パラメータを走査するだけ）
-        is_log_step = (
-            rank == 0 and global_step % hps.train.log_interval == 0 and not hps.speedup
-        )
-
-        (
-            y_hat,
-            l_length,
-            attn,
-            ids_slice,
-            x_mask,
-            z_mask,
-            (z, z_p, m_p, logs_p, m_q, logs_q),
-            (hidden_x, logw, logw_),  # , logw_sdp),
-            g,
-        ) = net_g(
-            x,
-            x_lengths,
-            spec,
-            spec_lengths,
-            speakers,
-            tone,
-            language,
-            bert,
-            style_vec,
-        )
-        mel = spec_to_mel_torch(
-            spec,
-            hps.data.filter_length,
-            hps.data.n_mel_channels,
-            hps.data.sampling_rate,
-            hps.data.mel_fmin,
-            hps.data.mel_fmax,
-        )
-        y_mel = commons.slice_segments(
-            mel, ids_slice, hps.train.segment_size // hps.data.hop_length
-        )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.squeeze(1).float(),
-            hps.data.filter_length,
-            hps.data.n_mel_channels,
-            hps.data.sampling_rate,
-            hps.data.hop_length,
-            hps.data.win_length,
-            hps.data.mel_fmin,
-            hps.data.mel_fmax,
-        )
-
-        y = commons.slice_segments(
-            y, ids_slice * hps.data.hop_length, hps.train.segment_size
-        )  # slice
-
-        # Discriminator
-        y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-            y_d_hat_r, y_d_hat_g
-        )
-        loss_disc_all = loss_disc
-        if net_dur_disc is not None:
-            y_dur_hat_r, y_dur_hat_g = net_dur_disc(
-                hidden_x.detach(),
-                x_mask.detach(),
-                logw_.detach(),
-                logw.detach(),
-                g.detach(),
-            )
-            # TODO: I think need to mean using the mask, but for now, just mean all
-            (
-                loss_dur_disc,
-                losses_dur_disc_r,
-                losses_dur_disc_g,
-            ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
-            loss_dur_disc_all = loss_dur_disc
-            optim_dur_disc.zero_grad()
-            loss_dur_disc_all.backward()
-            # 勾配ノルムはログに出力しないので計算しない（旧実装は毎回全パラメータを走査するだけだった）
-            optim_dur_disc.step()
-        if net_wd is not None:
-            # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
-            # shape: (batch, 1, time)
-            # WavLM の forward は 1ステップで実音声1回（no_grad）・生成音声1回（勾配あり）に統合する。
-            # 旧実装は forward()/generator()/discriminator() がそれぞれ独立に forward していて倍計算だった。
-            y_embeddings = wl.encode(y.detach().squeeze(1), requires_grad=False)
-            y_rec_embeddings = wl.encode(y_hat.detach().squeeze(1), requires_grad=False)
-            loss_slm = wl.discriminator(y_embeddings, y_rec_embeddings).mean()
-
-            optim_wd.zero_grad()
-            loss_slm.backward()
-            if is_log_step:
-                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
-            optim_wd.step()
-
-        optim_d.zero_grad()
-        loss_disc_all.backward()
-        if is_log_step:
-            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        optim_d.step()
-
-        # Generator
-        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-        if net_dur_disc is not None:
-            _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
-        if net_wd is not None:
-            # 実音声側（y）の WavLM forward は判別器ステップで共有した no_grad 結果を使い、
-            # 生成音声側（y_hat）は勾配を流すため勾配ありで再度 forward する（no_grad 版とは別計算）
-            y_rec_embeddings_grad = wl.encode(y_hat.squeeze(1), requires_grad=True)
-            loss_lm = wl(y_embeddings, y_rec_embeddings_grad).mean()
-            loss_lm_gen = wl.generator(y_rec_embeddings_grad)
-        loss_dur = torch.sum(l_length.float())
-        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
-        loss_fm = feature_loss(fmap_r, fmap_g)
-        loss_gen, losses_gen = generator_loss(y_d_hat_g)
-        # loss_commit = loss_commit * hps.train.c_commit
-
-        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-        if net_dur_disc is not None:
-            loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-            loss_gen_all += loss_dur_gen
-        # SLM(WavLM) の敵対学習損失は duration 判別器の有無と無関係に必ず生成器へ加算する
-        # （JP-Extra 既定は use_duration_discriminator: false なので、内側にネストすると常に未加算になっていた）
-        if net_wd is not None:
-            loss_gen_all += loss_lm + loss_lm_gen
-        optim_g.zero_grad()
-        loss_gen_all.backward()
-        # 実際のクリップは毎回必要なので clip_grad_norm_ は残し、その戻り値をログ用にそのまま使う
-        grad_norm_g = torch.nn.utils.clip_grad_norm_(
-            parameters=net_g.parameters(), max_norm=500
-        )
-        optim_g.step()
-
-        if rank == 0:
-            if is_log_step:
-                lr = optim_g.param_groups[0]["lr"]
-                # logger.info(
-                #     "Train Epoch: {} [{:.0f}%]".format(
-                #         epoch, 100.0 * batch_idx / len(train_loader)
-                #     )
-                # )
-                # logger.info([loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl] + [global_step, lr])
-
-                scalar_dict = {
-                    "loss/g/total": loss_gen_all,
-                    "loss/d/total": loss_disc_all,
-                    "learning_rate": lr,
-                    "grad_norm_d": grad_norm_d,
-                    "grad_norm_g": grad_norm_g,
-                }
-                scalar_dict.update(
-                    {
-                        "loss/g/fm": loss_fm,
-                        "loss/g/mel": loss_mel,
-                        "loss/g/dur": loss_dur,
-                        "loss/g/kl": loss_kl,
-                    }
-                )
-                scalar_dict.update({f"loss/g/{i}": v for i, v in enumerate(losses_gen)})
-                scalar_dict.update(
-                    {f"loss/d_r/{i}": v for i, v in enumerate(losses_disc_r)}
-                )
-                scalar_dict.update(
-                    {f"loss/d_g/{i}": v for i, v in enumerate(losses_disc_g)}
-                )
-
+        if batch_idx % accumulation_steps == 0:
+            # 累積ウィンドウの先頭で勾配をリセット（ウィンドウ内の backward が合計される）
+            optim_g.zero_grad()
+            optim_d.zero_grad()
+            if optim_dur_disc is not None:
+                optim_dur_disc.zero_grad()
+            if optim_wd is not None:
+                optim_wd.zero_grad()
+        with ExitStack() as stack:
+            if not is_opt_step:
+                stack.enter_context(net_g.no_sync())
+                stack.enter_context(net_d.no_sync())
                 if net_dur_disc is not None:
-                    scalar_dict.update({"loss/dur_disc/total": loss_dur_disc_all})
-
-                    scalar_dict.update(
-                        {
-                            f"loss/dur_disc_g/{i}": v
-                            for i, v in enumerate(losses_dur_disc_g)
-                        }
-                    )
-                    scalar_dict.update(
-                        {
-                            f"loss/dur_disc_r/{i}": v
-                            for i, v in enumerate(losses_dur_disc_r)
-                        }
-                    )
-
-                    scalar_dict.update({"loss/g/dur_gen": loss_dur_gen})
-                    scalar_dict.update(
-                        {f"loss/g/dur_gen_{i}": v for i, v in enumerate(losses_dur_gen)}
-                    )
-
+                    stack.enter_context(net_dur_disc.no_sync())
                 if net_wd is not None:
-                    scalar_dict.update(
-                        {
-                            "loss/wd/total": loss_slm,
-                            "grad_norm_wd": grad_norm_wd,
-                            "loss/g/lm": loss_lm,
-                            "loss/g/lm_gen": loss_lm_gen,
-                        }
-                    )
-                # 画像ログ（スペクトログラム・アライメントの TensorBoard 出力）は
-                # matplotlib の削除済み API に依存していたため撤去した（utils.plot_* も削除済み）
-                utils.summarize(
-                    writer=writer,
-                    global_step=global_step,
-                    scalars=scalar_dict,
+                    stack.enter_context(net_wd.no_sync())
+            if net_g.module.use_noise_scaled_mas:
+                current_mas_noise_scale = (
+                    net_g.module.mas_noise_scale_initial
+                    - net_g.module.noise_scale_delta * global_step
+                )
+                net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
+            x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
+                local_rank, non_blocking=True
+            )
+            spec, spec_lengths = spec.cuda(
+                local_rank, non_blocking=True
+            ), spec_lengths.cuda(local_rank, non_blocking=True)
+            y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
+                local_rank, non_blocking=True
+            )
+            speakers = speakers.cuda(local_rank, non_blocking=True)
+            tone = tone.cuda(local_rank, non_blocking=True)
+            language = language.cuda(local_rank, non_blocking=True)
+            bert = bert.cuda(local_rank, non_blocking=True)
+            style_vec = style_vec.cuda(local_rank, non_blocking=True)
+
+            # 勾配ノルムはログ出力ステップ（rank 0 のみ）だけ計算する（clip_grad_value_(..., None) はクリップせず毎回全パラメータを走査するだけ）
+            is_log_step = (
+                rank == 0
+                and global_step % hps.train.log_interval == 0
+                and not hps.speedup
+            )
+
+            (
+                y_hat,
+                l_length,
+                attn,
+                ids_slice,
+                x_mask,
+                z_mask,
+                (z, z_p, m_p, logs_p, m_q, logs_q),
+                (hidden_x, logw, logw_),  # , logw_sdp),
+                g,
+            ) = net_g(
+                x,
+                x_lengths,
+                spec,
+                spec_lengths,
+                speakers,
+                tone,
+                language,
+                bert,
+                style_vec,
+            )
+            mel = spec_to_mel_torch(
+                spec,
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+            )
+            y_mel = commons.slice_segments(
+                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+            )
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.squeeze(1).float(),
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.hop_length,
+                hps.data.win_length,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+            )
+
+            y = commons.slice_segments(
+                y, ids_slice * hps.data.hop_length, hps.train.segment_size
+            )  # slice
+
+            # Discriminator（3つの判別器損失を先に計算し、NaN ガードの判定を
+            # 1回の集合通信で全ランクへ揃えてから backward / step する。
+            # ランク間で backward の実行・不実行が分かれると DDP の集合通信が
+            # 不一致になってハングするため、判定は必ず all_reduce 経由で共有する）
+            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+            loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                y_d_hat_r, y_d_hat_g
+            )
+            loss_disc_all = loss_disc
+            if net_dur_disc is not None:
+                y_dur_hat_r, y_dur_hat_g = net_dur_disc(
+                    hidden_x.detach(),
+                    x_mask.detach(),
+                    logw_.detach(),
+                    logw.detach(),
+                    g.detach(),
+                )
+                # TODO: I think need to mean using the mask, but for now, just mean all
+                (
+                    loss_dur_disc,
+                    losses_dur_disc_r,
+                    losses_dur_disc_g,
+                ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
+                loss_dur_disc_all = loss_dur_disc
+            if net_wd is not None:
+                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
+                # shape: (batch, 1, time)
+                # WavLM の forward は 1ステップで実音声1回（no_grad）・生成音声1回（勾配あり）に統合する。
+                # 旧実装は forward()/generator()/discriminator() がそれぞれ独立に forward していて倍計算だった。
+                y_embeddings = wl.encode(y.detach().squeeze(1), requires_grad=False)
+                y_rec_embeddings = wl.encode(
+                    y_hat.detach().squeeze(1), requires_grad=False
+                )
+                loss_slm = wl.discriminator(y_embeddings, y_rec_embeddings).mean()
+
+            disc_losses = [loss_disc_all]
+            if net_dur_disc is not None:
+                disc_losses.append(loss_dur_disc_all)
+            if net_wd is not None:
+                disc_losses.append(loss_slm)
+            disc_ok = _all_ranks_finite(disc_losses, y.device)
+            if not disc_ok:
+                # 非有限損失は backward しても勾配がゴミなので、グラフを保ったまま
+                # 値だけゼロにしてから backward する（DDP Reducer の整合性維持）
+                loss_disc_all = _zero_loss(loss_disc_all)
+                if net_dur_disc is not None:
+                    loss_dur_disc_all = _zero_loss(loss_dur_disc_all)
+                if net_wd is not None:
+                    loss_slm = _zero_loss(loss_slm)
+
+            if net_dur_disc is not None:
+                loss_dur_disc_all.backward()
+                # 勾配ノルムはログに出力しないので計算しない（旧実装は毎回全パラメータを走査するだけだった）
+                if is_opt_step and disc_ok:
+                    optim_dur_disc.step()
+            if net_wd is not None:
+                loss_slm.backward()
+                if is_log_step:
+                    grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
+                if is_opt_step and disc_ok:
+                    optim_wd.step()
+
+            loss_disc_all.backward()
+            if is_log_step:
+                grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            if is_opt_step and disc_ok:
+                optim_d.step()
+            if not disc_ok:
+                # ゴミ勾配を次の累積ウィンドウへ引きずらない
+                optim_d.zero_grad()
+                if optim_dur_disc is not None:
+                    optim_dur_disc.zero_grad()
+                if optim_wd is not None:
+                    optim_wd.zero_grad()
+
+            # Generator
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+            if net_dur_disc is not None:
+                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+            if net_wd is not None:
+                # 実音声側（y）の WavLM forward は判別器ステップで共有した no_grad 結果を使い、
+                # 生成音声側（y_hat）は勾配を流すため勾配ありで再度 forward する（no_grad 版とは別計算）
+                y_rec_embeddings_grad = wl.encode(y_hat.squeeze(1), requires_grad=True)
+                loss_lm = wl(y_embeddings, y_rec_embeddings_grad).mean()
+                loss_lm_gen = wl.generator(y_rec_embeddings_grad)
+            loss_dur = torch.sum(l_length.float())
+            loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+            loss_fm = feature_loss(fmap_r, fmap_g)
+            loss_gen, losses_gen = generator_loss(y_d_hat_g)
+
+            # 敵対的損失のウォームアップ（adversarial_warmup_steps > 0 のとき、今回の
+            # 学習開始 step から線形に 0→1 でスケール）。判別器が未熟な初期段階で
+            # 生成器が無茶な敵対勾配に引っ張られるのを防ぐ。既定 0 は無効（従来動作）
+            adv_scale = 1.0
+            if hps.train.adversarial_warmup_steps > 0:
+                adv_scale = min(
+                    1.0,
+                    (global_step - initial_step + 1)
+                    / hps.train.adversarial_warmup_steps,
                 )
 
+            loss_gen_all = (
+                (loss_gen + loss_fm) * adv_scale + loss_mel + loss_dur + loss_kl
+            )
+            if net_dur_disc is not None:
+                loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                loss_gen_all += loss_dur_gen * adv_scale
+            # SLM(WavLM) の敵対学習損失は duration 判別器の有無と無関係に必ず生成器へ加算する
+            # （JP-Extra 既定は use_duration_discriminator: false なので、内側にネストすると常に未加算になっていた）
+            if net_wd is not None:
+                loss_gen_all += (loss_lm + loss_lm_gen) * adv_scale
+
+            # 生成器側も NaN ガード（判定は全ランク同期）。disc 側と同じ理由で
+            # backward はグラフごとゼロ化して通す
+            gen_ok = _all_ranks_finite([loss_gen_all], y.device)
+            if not gen_ok:
+                loss_gen_all = _zero_loss(loss_gen_all)
+            loss_gen_all.backward()
+            # 実際のクリップは更新ステップのみ（累積中は勾配が途中経過なので
+            # 中間ステップでクリップすると合計勾配が過小になる）。戻り値はログ用に使う
+            grad_norm_g = None
+            if is_opt_step:
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(
+                    parameters=net_g.parameters(), max_norm=500
+                )
+            if is_opt_step and gen_ok:
+                optim_g.step()
+                _ema_update(net_g, hps.train.ema_decay)
+            if not gen_ok:
+                optim_g.zero_grad()
+
+            # 非有限損失（NaN/inf）ガード。判定は全ランク同期済みなので、
+            # スキップも停止も全ランクで同時に起きる（ハングしない）
+            if disc_ok and gen_ok:
+                _nan_skip_count = 0
+            else:
+                _nan_skip_count += 1
+                if rank == 0:
+                    logger.warning(
+                        f"step {global_step}: 非有限損失（NaN/inf）を検出したため optimizer の更新を"
+                        f"スキップしました（連続 {_nan_skip_count} 回目）"
+                    )
+                if (
+                    hps.train.nan_guard_max_skips > 0
+                    and _nan_skip_count >= hps.train.nan_guard_max_skips
+                ):
+                    raise RuntimeError(
+                        f"非有限損失が {_nan_skip_count} ステップ連続で発生したため学習を停止します。"
+                        "学習率の高すぎ・データの破損を点検してください"
+                        "（nan_guard_max_skips: 0 で無効化可能）"
+                    )
+
+            if rank == 0:
+                if is_log_step:
+                    lr = optim_g.param_groups[0]["lr"]
+                    # logger.info(
+                    #     "Train Epoch: {} [{:.0f}%]".format(
+                    #         epoch, 100.0 * batch_idx / len(train_loader)
+                    #     )
+                    # )
+                    # logger.info([loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl] + [global_step, lr])
+
+                    scalar_dict = {
+                        "loss/g/total": loss_gen_all,
+                        "loss/d/total": loss_disc_all,
+                        "learning_rate": lr,
+                        "grad_norm_d": grad_norm_d,
+                        "grad_norm_g": grad_norm_g,
+                    }
+                    scalar_dict.update(
+                        {
+                            "loss/g/fm": loss_fm,
+                            "loss/g/mel": loss_mel,
+                            "loss/g/dur": loss_dur,
+                            "loss/g/kl": loss_kl,
+                        }
+                    )
+                    scalar_dict.update(
+                        {f"loss/g/{i}": v for i, v in enumerate(losses_gen)}
+                    )
+                    scalar_dict.update(
+                        {f"loss/d_r/{i}": v for i, v in enumerate(losses_disc_r)}
+                    )
+                    scalar_dict.update(
+                        {f"loss/d_g/{i}": v for i, v in enumerate(losses_disc_g)}
+                    )
+
+                    if net_dur_disc is not None:
+                        scalar_dict.update({"loss/dur_disc/total": loss_dur_disc_all})
+
+                        scalar_dict.update(
+                            {
+                                f"loss/dur_disc_g/{i}": v
+                                for i, v in enumerate(losses_dur_disc_g)
+                            }
+                        )
+                        scalar_dict.update(
+                            {
+                                f"loss/dur_disc_r/{i}": v
+                                for i, v in enumerate(losses_dur_disc_r)
+                            }
+                        )
+
+                        scalar_dict.update({"loss/g/dur_gen": loss_dur_gen})
+                        scalar_dict.update(
+                            {
+                                f"loss/g/dur_gen_{i}": v
+                                for i, v in enumerate(losses_dur_gen)
+                            }
+                        )
+
+                    if net_wd is not None:
+                        scalar_dict.update(
+                            {
+                                "loss/wd/total": loss_slm,
+                                "grad_norm_wd": grad_norm_wd,
+                                "loss/g/lm": loss_lm,
+                                "loss/g/lm_gen": loss_lm_gen,
+                            }
+                        )
+                    # 勾配累積の中間マイクロバッチ（is_opt_step でないステップ）では
+                    # 勾配クリップしないため grad_norm_g は None。TensorBoard に
+                    # None を渡さないよう除外する
+                    scalar_dict = {
+                        k: v for k, v in scalar_dict.items() if v is not None
+                    }
+                    # 画像ログ（スペクトログラム・アライメントの TensorBoard 出力）は
+                    # matplotlib の削除済み API に依存していたため撤去した（utils.plot_* も削除済み）
+                    utils.summarize(
+                        writer=writer,
+                        global_step=global_step,
+                        scalars=scalar_dict,
+                    )
+
+                if (
+                    global_step % hps.train.eval_interval == 0
+                    and global_step != 0
+                    and initial_step != global_step
+                ):
+                    if not hps.speedup:
+                        evaluate(hps, net_g, eval_loader, writer_eval)
+                        val_metrics = validate_loss(hps, net_g, eval_loader, writer)
+                        if val_metrics:
+                            _eval_history.append(
+                                {
+                                    "step": global_step,
+                                    "epoch": epoch,
+                                    "val": val_metrics,
+                                    # 検証セットの識別子。val.list を変更したら旧履歴の
+                                    # 損失は比較不能になるので読み込み時に除外する
+                                    "val_hash": _val_hash,
+                                }
+                            )
+                            _save_eval_history(hps)
+                            if hps.train.early_stopping_enabled:
+                                stop, reason = _early_stop_check(
+                                    _eval_history, hps, initial_step
+                                )
+                                if stop:
+                                    early_stop_requested = True
+                                    best = _best_eval_entry(
+                                        _eval_history, hps, initial_step
+                                    )
+                                    logger.info(
+                                        f"Early stopping condition met at step {global_step}: {reason}"
+                                        + (
+                                            ""
+                                            if best is None
+                                            else _best_summary(hps, best[0], best[1])
+                                        )
+                                    )
+                    utils.checkpoints.save_checkpoint(
+                        net_g,
+                        optim_g,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(hps.model_dir, f"G_{global_step}.pth"),
+                    )
+                    utils.checkpoints.save_checkpoint(
+                        net_d,
+                        optim_d,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(hps.model_dir, f"D_{global_step}.pth"),
+                    )
+                    if net_dur_disc is not None:
+                        utils.checkpoints.save_checkpoint(
+                            net_dur_disc,
+                            optim_dur_disc,
+                            hps.train.learning_rate,
+                            epoch,
+                            os.path.join(hps.model_dir, f"DUR_{global_step}.pth"),
+                        )
+                    if net_wd is not None:
+                        utils.checkpoints.save_checkpoint(
+                            net_wd,
+                            optim_wd,
+                            hps.train.learning_rate,
+                            epoch,
+                            os.path.join(hps.model_dir, f"WD_{global_step}.pth"),
+                        )
+                    keep_ckpts = hps.train.keep_ckpts
+                    if keep_ckpts > 0:
+                        utils.checkpoints.clean_checkpoints(
+                            model_dir_path=hps.model_dir,
+                            n_ckpts_to_keep=keep_ckpts,
+                            sort_by_time=True,
+                        )
+                    # Save safetensors (for inference) to `model_assets/{model_name}`
+                    saved_safetensors = os.path.join(
+                        hps.out_dir,
+                        f"{hps.model_name}_e{epoch}_s{global_step}.safetensors",
+                    )
+                    utils.safetensors.save_safetensors(
+                        net_g, epoch, saved_safetensors, for_infer=True
+                    )
+                    if _ema_state is not None:
+                        _save_ema_safetensors(
+                            net_g,
+                            epoch,
+                            saved_safetensors.replace(
+                                ".safetensors", "_ema.safetensors"
+                            ),
+                        )
+                    # 監視指標上の best を毎回更新して記録する。停止を待たずとも、どの
+                    # .safetensors を推論に使うべきかが常に参照できる（手動中断でも失われない）。
+                    # safetensors 保存「後」に置くことで best が現 step でも実在する状態になる
+                    best = _best_eval_entry(_eval_history, hps, initial_step)
+                    if best is not None:
+                        _save_best_checkpoint(hps, best[0], best[1])
+                    # keep_safetensors 上限で古い eval 資産を整理（best の step は必ず残す）
+                    _clean_safetensors(
+                        hps.out_dir,
+                        hps.train.keep_safetensors,
+                        best_step=None if best is None else best[0]["step"],
+                    )
+
+            # 停止判定を全ランクで同期する。ブロードキャスト条件は評価ブロックの条件と
+            # 同一にしておく（global_step は全ランク同一値なので同じ反復で合流できる）。
+            # nccl は全ランクが同じステップで集合通信を抜けなければハングするため
             if (
                 global_step % hps.train.eval_interval == 0
                 and global_step != 0
                 and initial_step != global_step
+                and dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
             ):
-                if not hps.speedup:
-                    evaluate(hps, net_g, eval_loader, writer_eval)
-                utils.checkpoints.save_checkpoint(
-                    net_g,
-                    optim_g,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, f"G_{global_step}.pth"),
-                )
-                utils.checkpoints.save_checkpoint(
-                    net_d,
-                    optim_d,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, f"D_{global_step}.pth"),
-                )
-                if net_dur_disc is not None:
-                    utils.checkpoints.save_checkpoint(
-                        net_dur_disc,
-                        optim_dur_disc,
-                        hps.train.learning_rate,
-                        epoch,
-                        os.path.join(hps.model_dir, f"DUR_{global_step}.pth"),
-                    )
-                if net_wd is not None:
-                    utils.checkpoints.save_checkpoint(
-                        net_wd,
-                        optim_wd,
-                        hps.train.learning_rate,
-                        epoch,
-                        os.path.join(hps.model_dir, f"WD_{global_step}.pth"),
-                    )
-                keep_ckpts = hps.train.keep_ckpts
-                if keep_ckpts > 0:
-                    utils.checkpoints.clean_checkpoints(
-                        model_dir_path=hps.model_dir,
-                        n_ckpts_to_keep=keep_ckpts,
-                        sort_by_time=True,
-                    )
-                # Save safetensors (for inference) to `model_assets/{model_name}`
-                utils.safetensors.save_safetensors(
-                    net_g,
-                    epoch,
-                    os.path.join(
-                        hps.out_dir,
-                        f"{hps.model_name}_e{epoch}_s{global_step}.safetensors",
-                    ),
-                    for_infer=True,
-                )
+                obj = [early_stop_requested]
+                dist.broadcast_object_list(obj, src=0)
+                early_stop_requested = obj[0]
+            if early_stop_requested:
+                # global_step を増やす前に抜ける（評価ステップで保存済みのチェックポイントと一致させる）
+                break
 
-        global_step += 1
-        if pbar is not None:
-            pbar.set_description(
-                f"Epoch {epoch}({100.0 * batch_idx / len(train_loader):.0f}%)/{hps.train.epochs}"
-            )
-            pbar.update()
+            global_step += 1
+            if pbar is not None:
+                pct = 100.0 * batch_idx / len(train_loader)
+                if hps.train.early_stopping_enabled:
+                    # 収束で打ち切り上限より前に止まりうるので、上限は接頭辞を付け、
+                    # 早期停止の判定単位である絶対stepも常時表示する
+                    desc = (
+                        f"Epoch {epoch}({pct:.0f}%)/上限{hps.train.epochs}"
+                        f" step {global_step}"
+                    )
+                else:
+                    desc = f"Epoch {epoch}({pct:.0f}%)/{hps.train.epochs}"
+                pbar.set_description(desc)
+                pbar.update()
 
     # caching allocator が空きを再利用するため、エポックごとの empty_cache は不要（削除）
     gc.collect()
     if pbar is None and rank == 0:
         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
+    return early_stop_requested
 
 
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
     audio_dict = {}
-    print()
     logger.info("Evaluating ...")
     with torch.no_grad():
         for batch_idx, (
@@ -1056,6 +1605,290 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         audio_sampling_rate=hps.data.sampling_rate,
     )
     generator.train()
+
+
+def validate_loss(hps, net_g, eval_loader, writer):
+    """検証データ（val.list）で非敵対損失（mel/dur/kl）を計算し TensorBoard の val/* に書き込む。
+
+    早期停止の監視指標。学習ステップと同じ forward（MAS アライメント + ランダムスライス）を
+    使うが、評価間で値を比較できるようシードを固定し MAS ノイズを 0 にする。
+    敵対損失（fm/gen/wd 系）は判別器の状態に依存して単調でなくなるため監視に使わない。
+    DDP ラッパを介さず module を直接呼ぶ（rank 0 だけの forward で broadcast_buffers による
+    集合通信が発生すると他ランクが待っておらずハングするため）。
+
+    Args:
+        hps: ハイパーパラメータ
+        net_g: 生成器（DDP ラップ可）
+        eval_loader: val.list のデータローダ（batch_size=1）
+        writer: TensorBoard writer
+
+    Returns:
+        dict: 平均検証損失 {"mel":..,"dur":..,"kl":..,"total":..}。val.list が空なら {}
+    """
+    module = getattr(net_g, "module", net_g)
+    if eval_loader is None or len(eval_loader) == 0:
+        return {}
+
+    # 学習ループの乱数系列を乱さないよう RNG 状態を退避し、決定論的な検証損失を作る
+    rng_cpu = torch.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    saved_mas_noise = getattr(module, "current_mas_noise_scale", None)
+
+    totals = {"mel": 0.0, "dur": 0.0, "kl": 0.0}
+    n_batches = 0
+    module.eval()
+    with torch.no_grad():
+        torch.manual_seed(hps.train.seed)
+        if (
+            getattr(module, "use_noise_scaled_mas", False)
+            and saved_mas_noise is not None
+        ):
+            module.current_mas_noise_scale = 0.0
+        for (
+            x,
+            x_lengths,
+            spec,
+            spec_lengths,
+            y,
+            y_lengths,
+            speakers,
+            tone,
+            language,
+            bert,
+            style_vec,
+        ) in eval_loader:
+            x, x_lengths = x.cuda(), x_lengths.cuda()
+            spec, spec_lengths = spec.cuda(), spec_lengths.cuda()
+            speakers = speakers.cuda()
+            tone = tone.cuda()
+            language = language.cuda()
+            bert = bert.cuda()
+            style_vec = style_vec.cuda()
+            (
+                y_hat,
+                l_length,
+                attn,
+                ids_slice,
+                x_mask,
+                z_mask,
+                (z, z_p, m_p, logs_p, m_q, logs_q),
+                (hidden_x, logw, logw_),
+                g,
+            ) = module(
+                x,
+                x_lengths,
+                spec,
+                spec_lengths,
+                speakers,
+                tone,
+                language,
+                bert,
+                style_vec,
+            )
+            mel = spec_to_mel_torch(
+                spec,
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+            )
+            y_mel = commons.slice_segments(
+                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+            )
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.squeeze(1).float(),
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.hop_length,
+                hps.data.win_length,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+            )
+            totals["mel"] += F.l1_loss(y_mel, y_hat_mel).item() * hps.train.c_mel
+            totals["kl"] += (
+                kl_loss(z_p, logs_q, m_p, logs_p, z_mask).item() * hps.train.c_kl
+            )
+            totals["dur"] += torch.sum(l_length.float()).item()
+            n_batches += 1
+    module.train()
+
+    if rng_cuda is not None:
+        torch.cuda.set_rng_state(rng_cuda)
+    torch.set_rng_state(rng_cpu)
+    if saved_mas_noise is not None:
+        module.current_mas_noise_scale = saved_mas_noise
+
+    avg = {k: v / n_batches for k, v in totals.items()}
+    # total は mel + dur + kl の単なる合計。mel は c_mel（既定45）倍で桁が大きく、
+    # dur は音素数で正規化済みの MSE（batch_size=1 の評価では1発話あたり値）なので、
+    # total は実質 mel 支配になる。dur 変化だけを追いたい場合は monitor: "dur" を使うこと
+    avg["total"] = sum(avg.values())
+    utils.summarize(
+        writer=writer,
+        global_step=global_step,
+        scalars={f"val/{k}": v for k, v in avg.items()},
+    )
+    logger.info(
+        f"Validation loss at step {global_step}: "
+        + ", ".join(f"{k}={v:.4f}" for k, v in avg.items())
+    )
+    return avg
+
+
+def _save_eval_history(hps) -> None:
+    """検証損失履歴を models/eval_history.json に保存する（再開時も早期停止判定へ引き継ぐ）"""
+    path = Path(hps.model_dir) / "eval_history.json"
+    try:
+        path.write_text(
+            json.dumps(_eval_history, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as e:
+        logger.warning(f"eval_history.json の保存に失敗しました: {e}")
+
+
+def _best_eval_entry(
+    history: list[dict], hps, initial_step: int
+) -> tuple[dict, str] | None:
+    """監視指標で見た最良の評価を (履歴entry, 監視キー) で返す。評価が無ければ None。
+
+    判定窓は _early_stop_check と揃える（min_steps 超の評価のみ）。窓を揃えないと
+    「停止理由が指す best」と「残す best」が食い違うため。min_steps 未達で窓が空に
+    なる間は全履歴から選ぶ（best 自体は早期停止の有無に関係なく有益なので出す）。
+    """
+    key = hps.train.early_stopping_monitor
+    if key not in ("mel", "dur", "kl", "total"):
+        key = "mel"
+    judged = history
+    min_steps = hps.train.early_stopping_min_steps
+    if hps.train.early_stopping_enabled and min_steps > 0:
+        threshold = initial_step + min_steps
+        filtered = [entry for entry in history if entry["step"] > threshold]
+        if filtered:
+            judged = filtered
+    scored = [entry for entry in judged if key in entry.get("val", {})]
+    if not scored:
+        return None
+    return min(scored, key=lambda entry: entry["val"][key]), key
+
+
+def _best_summary(hps, entry: dict, key: str) -> str:
+    """best 評価を人間可読にする（早期停止ログで「どのファイルを使うべきか」を明示するため）"""
+    step = entry["step"]
+    epoch = entry.get("epoch")
+    name = f"{hps.model_name}_e{epoch}_s{step}.safetensors"
+    return (
+        f" / 監視指標 {key} の best は step {step}（{entry['val'][key]:.4f}）。"
+        f"残った .pth は停止step（再開用）なので、推論には "
+        f"{os.path.join(str(hps.out_dir), name)} を使用してください"
+    )
+
+
+def _save_best_checkpoint(hps, entry: dict, key: str) -> None:
+    """監視指標上の best を models/best_checkpoint.json へ書き出す。
+
+    keep_ckpts=1 では停止stepの .pth だけが残り、best の .pth は clean_checkpoints で
+    削除済み。.pth は再開用（optim 状態つき）で巻き戻せるものではないため、推論に使う
+    べき資産は別にあることを機械可読に残す。eval ごとの .safetensors は model_assets/
+    に全残存するので best は失われていない（3点セットの config.json / style_vectors.npy
+    は 1 ラン内で共通なので、どの .safetensors とも組める）。
+    """
+    step = entry["step"]
+    epoch = entry.get("epoch")
+    payload = {
+        "model_name": hps.model_name,
+        "step": step,
+        "epoch": epoch,
+        "monitor": key,
+        "value": entry["val"][key],
+        "safetensors": f"{hps.model_name}_e{epoch}_s{step}.safetensors",
+        "assets_dir": str(hps.out_dir),
+        "note": "早期停止の監視指標で最良の評価。models/ の .pth は停止stepのもので再開用",
+    }
+    path = Path(hps.model_dir) / "best_checkpoint.json"
+    try:
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as e:
+        logger.warning(f"best_checkpoint.json の保存に失敗しました: {e}")
+
+    # best の .safetensors を "best.safetensors" としても1点コピーする。
+    # keep_safetensors で古い eval 資産が削除されるようになり、best が古い step だと
+    # 実体が消える事態がありうるため、推論に使うべき1点は名前で固定参照できる実体を持つ。
+    # 3点セットの config.json / style_vectors.npy は 1 ラン内で共通なのでコピーは本体だけでよい。
+    # 同じ best のたびに ~120MB コピーし直さないよう、best step が変わるときだけコピーする
+    global _best_copied_step
+    src = Path(hps.out_dir) / payload["safetensors"]
+    dst = Path(hps.out_dir) / "best.safetensors"
+    if _best_copied_step != step and src.is_file():
+        try:
+            shutil.copyfile(src, dst)
+            _best_copied_step = step
+            logger.info(f"best を best.safetensors へコピーしました (step {step})")
+        except OSError as e:
+            logger.warning(f"best.safetensors へのコピーに失敗しました: {e}")
+
+
+def _early_stop_check(history: list[dict], hps, initial_step: int) -> tuple[bool, str]:
+    """検証損失履歴から早期停止すべきかを判定する。
+
+    - 判定開始点: early_stopping_min_steps が今回の学習開始点（再開時は再開step）から
+      経過した後の評価のみを判定に使う（それ以前の履歴は best・patience・プラトー窓に
+      一切数えない）。新規学習の早すぎる停止と、履歴を引き継いだ再開直後の即停止を防ぐ。
+      0 の場合は全履歴を対象にする
+    - patience: best 更新（min_delta 以上の改善）が無い評価が early_stopping_patience 回続いたら停止
+    - プラトー: 直近 early_stopping_plateau_window 評価の最小二乗回帰傾きの絶対値が
+      |平均値| × early_stopping_plateau_slope_eps 以下なら停止（0 で無効）
+
+    Returns:
+        tuple[bool, str]: (停止すべきか, 理由)
+    """
+    min_steps = hps.train.early_stopping_min_steps
+    if min_steps > 0:
+        threshold = initial_step + min_steps
+        history = [entry for entry in history if entry["step"] > threshold]
+
+    key = hps.train.early_stopping_monitor
+    if key not in ("mel", "dur", "kl", "total"):
+        logger.warning(f"early_stopping_monitor='{key}' は不明です。'mel' で判定します")
+        key = "mel"
+    vals = [entry["val"][key] for entry in history if key in entry.get("val", {})]
+    if len(vals) < 2:
+        return False, ""
+
+    # patience 判定（min_delta 付きの best 追跡）
+    best = float("inf")
+    counter = 0
+    for v in vals:
+        if v < best - hps.train.early_stopping_min_delta:
+            best = v
+            counter = 0
+        else:
+            counter += 1
+    if counter >= hps.train.early_stopping_patience:
+        return (
+            True,
+            f"patience 超過: best({key}={best:.4f}) 更新なしが {counter} 評価続いています",
+        )
+
+    # プラトー判定（窓内最小二乗回帰の相対傾き）
+    window = hps.train.early_stopping_plateau_window
+    if window >= 3 and len(vals) >= window:
+        ys = vals[-window:]
+        x_mean = (window - 1) / 2
+        y_mean = sum(ys) / window
+        denom = sum((x - x_mean) ** 2 for x in range(window))
+        slope = sum((x - x_mean) * (y - y_mean) for x, y in enumerate(ys)) / denom
+        threshold = hps.train.early_stopping_plateau_slope_eps * max(abs(y_mean), 1e-8)
+        if abs(slope) <= threshold:
+            return (
+                True,
+                f"プラトー検出: 直近 {window} 評価の傾き {slope:+.5f}/評価 が閾値 ±{threshold:.5f} 内",
+            )
+
+    return False, ""
 
 
 if __name__ == "__main__":

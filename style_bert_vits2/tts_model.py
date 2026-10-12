@@ -194,10 +194,16 @@ class TTSModel:
             # スタイルベクトルを取得するための推論モデルを初期化
             import torch
 
+            speaker_model = pyannote.audio.Model.from_pretrained(
+                "pyannote/wespeaker-voxceleb-resnet34-LM"
+            )
+            if speaker_model is None:
+                raise RuntimeError(
+                    "pyannote/wespeaker-voxceleb-resnet34-LM を読み込めませんでした。"
+                    "Hugging Face 側でモデルの利用条件に同意し、トークンを設定しているか確認してください。"
+                )
             self.style_vector_inference = pyannote.audio.Inference(
-                model=pyannote.audio.Model.from_pretrained(
-                    "pyannote/wespeaker-voxceleb-resnet34-LM"
-                ),
+                model=speaker_model,
                 window="whole",
             )
             self.style_vector_inference.to(torch.device(self.device))

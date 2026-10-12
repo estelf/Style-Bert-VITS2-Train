@@ -22,20 +22,50 @@ class HyperParametersTrain(BaseModel):
         0.99996  # エポック単位で係数を適用する（既定値だと100エポックで約0.4%しか減衰せず実質定数LR）
     )
     segment_size: int = 16384
-    init_lr_ratio: int = 1
     warmup_epochs: int = 0
     c_mel: int = 45
     c_kl: float = 1.0
-    c_commit: int = 100
     skip_optimizer: bool = False
     freeze_JP_bert: bool = False
-    freeze_emo: bool = False
     freeze_style: bool = False
     freeze_decoder: bool = False
     keep_ckpts: int = 1  # 0 で全チェックポイント保持
+    keep_safetensors: int = (
+        0  # model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し
+    )
     spec_cache: bool = True  # スペクトルキャッシュ（.spec.pt）を使うか
     num_workers: int = (
         2  # データローダのワーカー数（.spec.pt キャッシュが無い初回エポックの STFT 並列数。メモリが厳しいなら 1）
+    )
+    accumulation_steps: int = (
+        1  # 勾配累積ステップ数。1 で従来動作。VRAM 不足で batch_size を上げられない時の実効バッチ拡大用
+    )
+    adversarial_warmup_steps: int = (
+        0  # 敵対損失（fm/gen/dur_gen/lm 系）をこの実行開始から線形に 0→1 スケールするステップ数。0 で無効
+    )
+    ema_decay: float = (
+        0.999  # 生成器パラメータの EMA 減衰率（既定有効。0 で無効）。best.safetensors は検証損失を
+        # 実測している通常重み側なので、_ema.safetensors は聞き比べ用として併記される
+    )
+    nan_guard_max_skips: int = (
+        10  # 非有限損失（NaN/inf）がこの回数連続で出たら学習停止。0 で無効（スキップのみ）
+    )
+    # ---- 早期停止（既定で有効。val.list の非敵対損失で判定する。既存 config.json は
+    # キー無しでこの既定値が適用されるため壊れない。無効化は early_stopping_enabled: false）----
+    early_stopping_enabled: bool = True
+    early_stopping_monitor: str = "mel"  # 監視する検証損失: mel | dur | kl | total
+    early_stopping_min_steps: int = (
+        3000  # 今回の学習開始点（再開時は再開step）からの経過がこれを超える評価のみ判定に使う。0 で全履歴対象
+    )
+    early_stopping_patience: int = (
+        10  # best 更新（min_delta 以上の改善）が無い評価が続いたら停止
+    )
+    early_stopping_min_delta: float = 0.001  # これ未満の改善は best 更新とみなさない
+    early_stopping_plateau_window: int = (
+        5  # プラトー検出の窓（評価回数）。0 で無効。patience より先に平坦化で止めたい時に使う
+    )
+    early_stopping_plateau_slope_eps: float = (
+        0.002  # 窓内回帰傾きの絶対値が |平均値|×この値 以下ならプラトーとみなす
     )
 
 

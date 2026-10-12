@@ -76,3 +76,55 @@ def extract_bert_feature(
     phone_level_feature = torch.cat(phone_level_feature, dim=0)
 
     return phone_level_feature.T
+
+
+def extract_bert_feature_batch(
+    texts: list[str],
+    word2phs: list[list[int]],
+    device: str,
+    batch_size: int = 8,
+) -> list[torch.Tensor]:
+    """複数テキストの BERT 特徴を一括抽出する（preprocess/bert_gen.py 用・assist_text 非対応）。
+
+    1件ずつの forward に対し、右パディング + attention_mask でバッチ forward して GPU
+    稼働率を上げる。右パディングでは実トークンの位置（DeBERTa の相対距離を含む）が
+    単一抽出と同じまま余分な pad だけ後ろに付くため、実トークンの出力は単一抽出と一致する
+    （浮動小数の丸め差は許容。既存キャッシュは再生成されない限り影響しない）
+
+    Args:
+        texts (list[str]): テキストのリスト
+        word2phs (list[list[int]]): 各テキストの word2ph（add_blank 済みなら済みで渡す）
+        device (str): 推論に利用するデバイス
+        batch_size (int): forward のバッチサイズ
+
+    Returns:
+        list[torch.Tensor]: 各テキストの BERT 特徴（extract_bert_feature と同じ形）
+    """
+    import torch
+
+    # 単一版と同じく、word2ph と文字数の整合を取るため読めない文字を無視して正規化する
+    processed = ["".join(text_to_sep_kata(t, raise_yomi_error=False)[0]) for t in texts]
+
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    model = bert_models.load_model(device_map=device)
+    bert_models.transfer_model(device)
+    tokenizer = bert_models.load_tokenizer()
+
+    results: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, len(processed), batch_size):
+            chunk = processed[start : start + batch_size]
+            w2p = word2phs[start : start + batch_size]
+            inputs = tokenizer(chunk, return_tensors="pt", padding=True)
+            for i in inputs:
+                inputs[i] = inputs[i].to(device)  # type: ignore
+            res = model(**inputs, output_hidden_states=True)
+            hidden = torch.cat(res["hidden_states"][-3:-2], -1).cpu()
+            for b, (t, w) in enumerate(zip(chunk, w2p)):
+                assert len(w) == len(t) + 2, t
+                phone_level_feature = [
+                    hidden[b, i].repeat(w[i], 1) for i in range(len(w))
+                ]
+                results.append(torch.cat(phone_level_feature, dim=0).T)
+    return results
