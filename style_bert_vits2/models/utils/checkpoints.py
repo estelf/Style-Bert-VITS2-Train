@@ -35,7 +35,8 @@ def load_checkpoint(
         tuple[torch.nn.Module, Optional[torch.optim.Optimizer], float, int]: 更新されたモデルとオプティマイザー、学習率、イテレーション回数
 
     Raises:
-        ValueError: 欠損キー・形状不一致キーが MAX_MISMATCHED_KEYS 件を超えた場合
+        ValueError: 欠損キー・形状不一致キーが MAX_MISMATCHED_KEYS 件を超えた場合、
+            または話者埋め込み（emb_g.*）がチェックポイントと一致しない場合（再初期化は不可）
     """
 
     assert os.path.isfile(checkpoint_path)
@@ -97,6 +98,20 @@ def load_checkpoint(
             "The checkpoint does not match the current model configuration. Please check config.json (n_speakers etc.)."
         )
     elif mismatched_keys:
+        # 話者埋め込み（emb_g）の不一致だけは件数に関係なく必ず停止する。1キーだけと
+        # MAX_MISMATCHED_KEYS(8) を軽く通過して黙って再初期化されると、既存話者の埋め込みが
+        # ランダム値になり、学習も推論もその話者だけ別人音声になることに誰も気づかない
+        # （話者追加で再開する場合は config.json の n_speakers / spk2id の更新が必須）
+        emb_g_mismatch = [k for k in mismatched_keys if k.startswith("emb_g.")]
+        if emb_g_mismatch:
+            raise ValueError(
+                f"話者埋め込み {emb_g_mismatch} がチェックポイントと一致しません ({checkpoint_path})。"
+                "config.json の data.n_speakers / data.spk2id を既存チェックポイントと話者構成が"
+                "合っているか確認してください。話者を追加して学習を再開する場合は、追加後の話者IDに"
+                "合わせたチェックポイントが必要です（新規モデル名で学習するか、"
+                "意図的に話者埋め込みを再初期化する場合は checkpoints.py のこのガードを"
+                "一時的に外す必要があります）"
+            )
         logger.warning(
             f"{len(mismatched_keys)} keys were missing or shape-mismatched and re-initialized from {checkpoint_path}: {mismatched_keys}"
         )

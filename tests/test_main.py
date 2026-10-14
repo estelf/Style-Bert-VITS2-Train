@@ -75,15 +75,21 @@ def _prepare_dataset():
     # エポック数は最小にして、数ステップの学習で済ませる（回帰テストなので品質は問わない）
     preprocess_pkg.preprocess_all(
         model_name=MODEL_NAME,
-        batch_size=2,
-        epochs=1,
-        save_every_steps=1000,
+        set_overrides=[
+            "train.batch_size=2",
+            "train.epochs=1",
+            "train.eval_interval=1000",
+            "train.log_interval=1000",
+            "train.freeze_JP_bert=false",
+            "train.freeze_style=false",
+            "train.freeze_decoder=false",
+        ],
         num_processes=2,
-        freeze_JP_bert=False,
-        freeze_style=False,
-        freeze_decoder=False,
-        log_interval=1000,
+        # 検証なし（分割を既定の比率ベースにするとテストデータセット52件のうち10件が検証へ
+        # 回り、ゴールデン音声との比較に使う学習データが変わってしまう。契約テストなので
+        # 分割は過去と同じ「全件学習」に固定する）
         val_per_lang=0,
+        val_ratio=0.0,
         yomi_error="raise",
         reset_models=True,  # 前回の学習チェックポイントを残さず、毎回同じ初期状態から1エポック学習する
     )

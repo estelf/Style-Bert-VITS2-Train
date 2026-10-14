@@ -1,12 +1,19 @@
 """
 Style-Bert-VITS2 モデルのハイパーパラメータを表す Pydantic モデル。
-デフォルト値は configs/config_jp_extra.json 内の定義と概ね同一で、
-万が一ロードした config.json に存在しないキーがあった際のフェイルセーフとして適用される。
+
+このモデルのフィールド既定値が **全設定の単一のソース（SSOT）** である。
+- 前処理 Step1 は `default_config_dict()` でこの既定値から Data/<モデル>/config.json を生成する
+  （旧 configs/config_jp_extra.json テンプレートは、値がすべてここに移ったため削除した）
+- ロード時に config.json へ存在しないキーがあっても、この既定値がフェイルセーフとして適用される
+- CLI からの設定上書き（`preprocess_all.py --set`）も、このスキーマを正としてパス・値を検証する
 """
 
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
+
+# 学習時にのみ動的に設定されるパラメータ (通常 config.json には存在しない)
+_RUNTIME_ONLY_KEYS = ("model_dir", "out_dir", "dataset_path", "speedup")
 
 
 class HyperParametersTrain(BaseModel):
@@ -31,7 +38,10 @@ class HyperParametersTrain(BaseModel):
     freeze_decoder: bool = False
     keep_ckpts: int = 1  # 0 で全チェックポイント保持
     keep_safetensors: int = (
-        0  # model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し
+        12  # model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し。
+        # eval_interval=1000 ごとに通常+EMA の2枚（計約500MB）が増えるため、0 のまま
+        # 長期学習だと disk を圧迫する（40000step 走れば約20GB）。best.safetensors と
+        # best step の実体は間引き対象外なので、推論・select_best 用の1点は消えない
     )
     spec_cache: bool = True  # スペクトルキャッシュ（.spec.pt）を使うか
     num_workers: int = (
@@ -39,13 +49,24 @@ class HyperParametersTrain(BaseModel):
     )
     accumulation_steps: int = (
         1  # 勾配累積ステップ数。1 で従来動作。VRAM 不足で batch_size を上げられない時の実効バッチ拡大用
+        # （注意: global_step はオプティマイザ更新数でなくマイクロバッチ（forward-backward）数を数える。
+        #   accumulation_steps>1 では eval_interval / early_stopping_min_steps 等のステップ基準の値も
+        #   マイクロバッチ単位になる。実オプティマイザ更新数は global_step / accumulation_steps）
     )
     adversarial_warmup_steps: int = (
         0  # 敵対損失（fm/gen/dur_gen/lm 系）をこの実行開始から線形に 0→1 スケールするステップ数。0 で無効
     )
     ema_decay: float = (
-        0.999  # 生成器パラメータの EMA 減衰率（既定有効。0 で無効）。best.safetensors は検証損失を
-        # 実測している通常重み側なので、_ema.safetensors は聞き比べ用として併記される
+        0.999  # 生成器パラメータの EMA 減衰率（既定有効。0 で無効）。評価・最終保存に
+        # `<モデル名>_e<epoch>_s<step>_ema.safetensors` が併記される。検証損失の実測は
+        # 通常重み側だが、同一 step 比較で EMA 重みの方が合成品質に優位なため、
+        # best.safetensors は既定で EMA 側をコピーする（best_use_ema を参照）
+    )
+    best_use_ema: bool = (
+        True  # best.safetensors を best step の EMA 重み（本体の _ema.safetensors）から
+        # コピーする。best step 自体は通常重みの検証損失で選んだまま、書き出す実体だけ
+        # 差し替える。EMA 実体が無い step（ema_decay=0 等）は自動的に通常重みへフォールバック。
+        # false で従来動作（best.safetensors = 検証を実測した通常重み）
     )
     nan_guard_max_skips: int = (
         10  # 非有限損失（NaN/inf）がこの回数連続で出たら学習停止。0 で無効（スキップのみ）
@@ -53,7 +74,9 @@ class HyperParametersTrain(BaseModel):
     # ---- 早期停止（既定で有効。val.list の非敵対損失で判定する。既存 config.json は
     # キー無しでこの既定値が適用されるため壊れない。無効化は early_stopping_enabled: false）----
     early_stopping_enabled: bool = True
-    early_stopping_monitor: str = "mel"  # 監視する検証損失: mel | dur | kl | total
+    early_stopping_monitor: str = (
+        "mel"  # 監視する検証損失: mel | dur | kl | lm | total（lm は WavLM 特徴一致。total は mel+dur+kl の和で lm は含まない）
+    )
     early_stopping_min_steps: int = (
         3000  # 今回の学習開始点（再開時は再開step）からの経過がこれを超える評価のみ判定に使う。0 で全履歴対象
     )
@@ -61,6 +84,29 @@ class HyperParametersTrain(BaseModel):
         10  # best 更新（min_delta 以上の改善）が無い評価が続いたら停止
     )
     early_stopping_min_delta: float = 0.001  # これ未満の改善は best 更新とみなさない
+    early_stopping_min_delta_rel: float = (
+        0.01  # 絶対値ではなく best に対する割合で見る閾値（1%）。実際の判定は max(min_delta, best×この値)。
+        # 検証損失は評価ノイズで揺れる（検証47件の実測で1評価の揺らぎ σ=0.70%、検証4件だと3.4%）。
+        # 0.5% はノイズ帯（0.7σ）なので約4件に1件の割合で運だけの best 更新が起き、patience が
+        # ほぼ永遠に発火しなかった。1%（1.4σ）で実質的な改善だけ best 更新とみなし、patience を
+        # 機能させる（品質が下がり始める前に早めに止まる方向に効く）。0 で従来動作
+    )
+    early_stopping_best_smooth: int = (
+        5  # best チェックポイント選定を窓内中央値で行う幅（1 で従来動作の単発最小値）。
+        # 1評価のノイズ（σ 0.70%）で偶発的に低く出た step を best に選ぶ「くじ引き」を防ぎ、
+        # 近傍ごと安定して低い step を選ぶ。窓3でも運の要素が残ったため実測ノイズに合わせて5。
+        # 0 以下は 1 扱い
+    )
+    early_stopping_action: str = (
+        "stop"  # 停止条件到達時の動作: "stop" で学習停止、"reduce_lr" で学習率を半減して続行し、
+        # reduce_lr_times 回使い切ったら停止（ReduceLROnPlateau 相当。プラトー後に再改善する学習で有効）
+    )
+    early_stopping_reduce_lr_factor: float = (
+        0.5  # early_stopping_action="reduce_lr" のときの学習率乗数（0〜1）
+    )
+    early_stopping_reduce_lr_times: int = (
+        3  # 学習率削減を許容する最大回数。使い切ったら停止条件到達で学習停止
+    )
     early_stopping_plateau_window: int = (
         5  # プラトー検出の窓（評価回数）。0 で無効。patience より先に平坦化で止めたい時に使う
     )
@@ -144,6 +190,16 @@ class HyperParameters(BaseModel):
 
     # model_ 以下を Pydantic の保護対象から除外する
     model_config = ConfigDict(protected_namespaces=())
+
+    @classmethod
+    def default_config_dict(cls) -> dict:
+        """前処理 Step1 が Data/<モデル>/config.json を作る際の base を返す。
+
+        旧 configs/config_jp_extra.json テンプレートが担っていた役割を、既定値の単一ソースである
+        この Pydantic モデルから生成する（テンプレ二重管理の解消）。学習時にだけ入る
+        model_dir/out_dir/dataset_path/speedup は config.json に含めない。
+        """
+        return cls().model_dump(mode="json", exclude=set(_RUNTIME_ONLY_KEYS))
 
     @staticmethod
     def load_from_json(json_path: str | Path) -> "HyperParameters":
