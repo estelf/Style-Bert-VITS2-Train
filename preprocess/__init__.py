@@ -45,8 +45,18 @@ def check_dataset(model_name: str) -> None:
     logger.success("Step 3: dataset check finished.")
 
 
-def preprocess_text(model_name: str, val_per_lang: int, yomi_error: str) -> None:
+def preprocess_text(
+    model_name: str,
+    val_per_lang: int,
+    yomi_error: str,
+    max_val_total: int = 100,
+    val_ratio: float = 0.05,
+    min_val: int = 20,
+) -> None:
     """Step 4: 書き起こしファイル（esd.list）から train.list / val.list を作る。
+
+    検証件数は既定は比率ベース（val_ratio、話者ごとに round(発話数×ratio)。下限 min_val）。
+    val_per_lang > 0 のときだけ件数固定に上書きする。
 
     Raises:
         RuntimeError: 書き起こしファイルの前処理に失敗した場合
@@ -60,6 +70,12 @@ def preprocess_text(model_name: str, val_per_lang: int, yomi_error: str) -> None
             model_name,
             "--val-per-lang",
             str(val_per_lang),
+            "--val-ratio",
+            str(val_ratio),
+            "--min-val",
+            str(min_val),
+            "--max-val-total",
+            str(max_val_total),
             "--yomi_error",
             yomi_error,
             "--correct_path",  # 音声ファイルのパスを正しいパスに修正する
@@ -116,17 +132,12 @@ def style_gen(model_name: str, num_processes: int) -> None:
 
 def preprocess_all(
     model_name: str,
-    batch_size: int | None = None,
-    epochs: (
-        int | None
-    ) = None,  # 打ち切り上限。早期停止（既定有効）が収束判定するため、到達しないことがある
-    save_every_steps: int | None = None,
+    set_overrides: list[str] | None = None,
     num_processes: int = 2,
-    freeze_JP_bert: bool | None = None,
-    freeze_style: bool | None = None,
-    freeze_decoder: bool | None = None,
-    val_per_lang: int = 4,  # 話者ごとの検証データ数（上流既定の4。0 で無効化）
-    log_interval: int | None = None,
+    val_per_lang: int = 0,  # >0 で検証件数を実数固定（既定0は比率ベース）
+    val_ratio: float = 0.05,  # 検証発話の比率（話者ごとに round(発話数×ratio)。0 で検証なし）
+    min_val: int = 20,  # 比率ベースの検証件数の下限（その話者の発話数の1/5を超えない）
+    max_val_total: int = 100,  # 検証発話の総上限（超過分は話者按比例で縮小して学習へ戻す）
     yomi_error: str = "raise",
     reset_models: bool = False,
 ) -> None:
@@ -134,14 +145,24 @@ def preprocess_all(
 
     Args:
         model_name (str): データセット名（Data/<モデル名> を使う・作る）
-        batch_size / epochs / save_every_steps / log_interval / freeze_*: 既存 config.json の
-            対応キーへ書き込む値。None（既定）は既存値・テンプレート既定を尊重する
-            （再実行で手動編集が失われないようにするため）
+        set_overrides (list[str] | None): config.json の設定上書きを "dotted.path=value" で
+            指定する（例: ["train.batch_size=4", "train.freeze_style=true"]）。指定したものだけ、
+            既存 config.json の値より後の最優先で反映する（未指定キーは既存値・既定値を尊重し、
+            再実行で手編集が失われない）。パス・値は HyperParameters スキーマで検証される。
         reset_models (bool): True の場合のみ models/ をバックアップして事前学習モデルでリセットする。既定では既存チェックポイントを上書きしない
         yomi_error (str): 読み上げエラー時の挙動。Options: raise, skip, use
+        val_per_lang (int): 検証発話を話者ごとにこの件数へ固定する（既定0で比率ベース。
+            >0 のとき val_ratio より優先される）
+        val_ratio (float): 検証発話の比率。話者ごとに round(発話数×ratio) 件を検証へ回す
+            （0 で検証なし＝全件学習。検証損失の評価ノイズは 1/sqrt(件数) で減るため、
+            早期停止を使うなら最低20件は欲しい）
+        min_val (int): 比率ベースの検証件数の下限。ただしその話者の発話数の1/5を超えない
+            （小規模話者が学習データを検証に食われすぎないための上限も兼ねる）
+        max_val_total (int): 検証発話の総上限。超えた分は話者按比例で縮小して学習へ戻す
+            （縮小時は Step 4 で警告される）
 
     Raises:
-        ValueError: モデル名が空の場合
+        ValueError: モデル名が空の場合、または set_overrides の指定が不正な場合
         RuntimeError: いずれかの段階が失敗した場合
     """
     if model_name == "":
@@ -158,19 +179,18 @@ def preprocess_all(
     download_jp_extra_pretrained_models()
     initialize(
         model_name=model_name,
-        batch_size=batch_size,
-        epochs=epochs,
-        save_every_steps=save_every_steps,
-        freeze_JP_bert=freeze_JP_bert,
-        freeze_style=freeze_style,
-        freeze_decoder=freeze_decoder,
-        log_interval=log_interval,
+        set_overrides=set_overrides,
         reset_models=reset_models,
     )
     extract_raw(model_name=model_name)
     check_dataset(model_name=model_name)
     preprocess_text(
-        model_name=model_name, val_per_lang=val_per_lang, yomi_error=yomi_error
+        model_name=model_name,
+        val_per_lang=val_per_lang,
+        yomi_error=yomi_error,
+        max_val_total=max_val_total,
+        val_ratio=val_ratio,
+        min_val=min_val,
     )
     bert_gen(model_name=model_name)
     style_gen(model_name=model_name, num_processes=num_processes)

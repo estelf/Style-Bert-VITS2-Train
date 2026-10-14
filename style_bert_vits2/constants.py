@@ -20,12 +20,31 @@ ASSETS_ROOT = Path(os.environ.get("SBV2_ASSETS_ROOT", str(BASE_DIR / "model_asse
 
 # 学習時の分散環境変数のデフォルト（環境変数が未設定の場合に pipeline が使用。上書きしたい場合は環境変数を直接指定）
 TRAIN_ENV_DEFAULTS = {
-    "MASTER_ADDR": "::1",  # IPv6ループバック（WSL2 mirrored mode でも確実にbind/connectできるため localhost でなくリテラル指定）
+    "MASTER_ADDR": "::1",  # IPv6ループバック（WSL2 mirrored mode でも確実にbind/connectできるため localhost でなくリテラル指定。IPv6 自体が使えない環境では train/pipeline.py が 127.0.0.1 へフォールバックする）
     "MASTER_PORT": "10086",
     "WORLD_SIZE": "1",
     "RANK": "0",
     "LOCAL_RANK": "0",
 }
+
+# 学習バッチサンプラー（train/data_utils.py の DistributedBucketSampler）のバケット境界 [spec フレーム数]。
+# 保持されるのは MIN_SPEC_FRAMES < フレーム数 <= MAX_SPEC_FRAMES の音声だけで、境界外は学習時に黙って破棄される。
+# この1箇所だけを正とし、以下が同じ値を参照する:
+# - train/pipeline.py: サンプラーへ渡す（内部で pop されるので必ずコピーを渡すこと）と評価データの除外
+# - preprocess/check_dataset.py: 前処理段階での範囲外警告
+MIN_SPEC_FRAMES = 32  # 約0.37秒未満は除外
+MAX_SPEC_FRAMES = 1000  # 約11.6秒超は除外
+BUCKET_BOUNDARIES = [
+    MIN_SPEC_FRAMES,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    900,
+    MAX_SPEC_FRAMES,
+]
 
 
 # 利用可能な言語

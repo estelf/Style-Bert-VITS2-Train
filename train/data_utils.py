@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 import sys
@@ -142,8 +143,14 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         spec_filename = str(Path(filename).with_suffix(".spec.pt"))
         if self.use_mel_spec_posterior:
             spec_filename = spec_filename.replace(".spec.pt", ".mel.pt")
-        # キャッシュキーに STFT 設定を持たせ、filter_length/hop_length/win_length/sampling_rate を
-        # 変えたときに古いスペクトログラムで学習が進まないようにする（旧形式や不一致なら作り直す）
+        # キャッシュキーに STFT 設定と音声内容のハッシュを持たせる。
+        # - STFT 設定: filter_length/hop_length/win_length/sampling_rate を変えたときに
+        #   古いスペクトログラムで学習が進まないようにする
+        # - audio_sha1: Step 2（extract_raw）を通さずに wavs/ の音声を差し替えた（リテイク）とき、
+        #   古い .spec.pt が黙って使われ続けるのを防ぐ。音声はキャッシュ有無に関係なく
+        #   毎回ロード済みなので、sha1 は STFT 再計算に比べれば無視できるコスト
+        #   （旧形式や不一致なら作り直す）
+        audio_sha1 = hashlib.sha1(audio.numpy().tobytes()).hexdigest()
         stft_params = {
             "filter_length": self.filter_length,
             "hop_length": self.hop_length,
@@ -155,6 +162,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             ),
             "mel_fmin": self.hparams.mel_fmin if self.use_mel_spec_posterior else None,
             "mel_fmax": self.hparams.mel_fmax if self.use_mel_spec_posterior else None,
+            "audio_sha1": audio_sha1,
         }
         spec = None
         if os.path.exists(spec_filename):
