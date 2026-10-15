@@ -128,12 +128,12 @@ def save_styles_by_dirs(
         style_vectors.append(trimmed_mean(groups[name]))
         names.append(name)
 
-    # Stack them to make (num_styles, 256)
+    # スタックして (num_styles, 256) の形にする
     style_vectors_npy = np.stack(style_vectors, axis=0)
     np.save(output_dir / "style_vectors.npy", style_vectors_npy)
     logger.info(f"Saved style vectors to {output_dir / 'style_vectors.npy'}")
 
-    # Save style2id config to json
+    # style2id を config.json へ保存
     style2id = {name: i for i, name in enumerate(names)}
     with open(config_path, encoding="utf-8") as f:
         json_dict = json.load(f)

@@ -56,7 +56,7 @@ class TTSModel:
             style_vec_path (Union[Path, NDArray[Any]]): スタイルベクトル (style_vectors.npy) のパス (直接 NDArray を指定することも可能)
             device (str): 音声合成時に利用するデバイス (cpu, cuda, mps など)
             dtype (str): 音声合成時に利用する重みの精度。既定の "float16"（フル半精度推論）または "float32"。
-                なお bfloat16 は仮数が8ビットしかなく、duration の ceil() 量子化と組み合わせて精度劣化が大きいため推論では非対応（学習は float32/bfloat16）。
+                なお bfloat16 は仮数が8ビットしかなく、duration の ceil() 量子化と組み合わせて精度劣化が大きいため推論では非対応（学習は float32 のみ。bf16/fp16 学習経路は廃止済み）。
         """
 
         self.model_path: Path = model_path
@@ -556,7 +556,7 @@ class TTSModelHolder:
             and self.current_model.model_path == model_path
             and self.current_model.dtype == self.dtype
         ):
-            # Already loaded
+            # Already loaded（同一モデル・同一 dtype は再ロードしない）
             speakers = list(self.current_model.spk2id.keys())
             styles = list(self.current_model.style2id.keys())
             return (

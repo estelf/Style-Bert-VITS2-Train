@@ -19,7 +19,7 @@ from style_bert_vits2.nlp import cleaned_text_to_sequence
 from style_bert_vits2.utils.bert_cache import bert_feature_key, load_bert_feature
 from train.mel_processing import mel_spectrogram_torch, spectrogram_torch
 
-"""Multi speaker version"""
+"""マルチ話者版のデータローダ（text / spec / wav / 話者ID）"""
 
 
 @cache
@@ -38,9 +38,9 @@ def _spec_length(audiopath: str, filter_length: int, hop_length: int) -> int:
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     """
-    1) loads audio, speaker_id, text pairs
-    2) normalizes text and converts them to sequences of integers
-    3) computes spectrograms from audio files.
+    1) 音声・話者ID・テキストの組を読み込む
+    2) テキストを正規化して整数列へ変換する
+    3) 音声からスペクトログラムを計算する
     """
 
     def __init__(
@@ -78,9 +78,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
     def _filter(self):
         """
-        Filter text & store spec lengths
+        学習に不適なサンプルを除外し、バケット分け用のスペクトル長を保持する
         """
-        # Store spectrogram lengths for Bucketing
+        # バケット分けのためスペクトログラム長を保持する
         # 実フレーム数ベースの厳密な出力フレーム数は _spec_length() 側で算出（コメント参照）
 
         audiopaths_sid_text_new = []
@@ -260,18 +260,18 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
 
 class TextAudioSpeakerCollate:
-    """Zero-pads model inputs and targets"""
+    """モデルへの入出力を max 長へ右ゼロパディングして 1 バッチにまとめる"""
 
     def __init__(self, return_ids=False):
         self.return_ids = return_ids
 
     def __call__(self, batch):
-        """Collate's training batch from normalized text, audio and speaker identities
+        """正規化済みテキスト・音声・話者IDから学習バッチを collate する
         PARAMS
         ------
         batch: [text_normalized, spec_normalized, wav_normalized, sid]
         """
-        # Right zero-pad all one-hot text sequences to max input length
+        # 全てのテキスト列（one-hot 相当）を max 入力長まで右ゼロパディングする
         _, ids_sorted_decreasing = torch.sort(
             torch.LongTensor([x[1].size(1) for x in batch]), dim=0, descending=True
         )
@@ -288,7 +288,7 @@ class TextAudioSpeakerCollate:
         text_padded = torch.LongTensor(len(batch), max_text_len)
         tone_padded = torch.LongTensor(len(batch), max_text_len)
         language_padded = torch.LongTensor(len(batch), max_text_len)
-        # JA bert
+        # JA BERT特徴（音素長へ展開済みの 1024 次元）
         ja_bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
         style_vec = torch.FloatTensor(len(batch), 256)
 
@@ -347,12 +347,13 @@ class TextAudioSpeakerCollate:
 
 class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
     """
-    Maintain similar input lengths in a batch.
-    Length groups are specified by boundaries.
-    Ex) boundaries = [b1, b2, b3] -> any batch is included either {x | b1 < length(x) <=b2} or {x | b2 < length(x) <= b3}.
+    1 バッチ内の入力長が揃うようにするサンプラー。
+    長さのグループは境界値で指定する。
+    例) boundaries = [b1, b2, b3] -> 各バッチは {x | b1 < length(x) <= b2} または
+    {x | b2 < length(x) <= b3} のいずれかから構成される。
 
-    It removes samples which are not included in the boundaries.
-    Ex) boundaries = [b1, b2, b3] -> any x s.t. length(x) <= b1 or length(x) > b3 are discarded.
+    境界外のサンプルは除外する。
+    例) boundaries = [b1, b2, b3] -> length(x) <= b1 または length(x) > b3 の x は破棄される。
     """
 
     def __init__(
@@ -402,7 +403,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                     buckets.pop(i)
                     self.boundaries.pop(i + 1)
             assert all(len(bucket) > 0 for bucket in buckets)
-        # When one bucket is not traversed
+        # 1つのバケットが走破されないケース（空バケットが残る）
         except Exception as e:
             logger.info("Bucket warning ", e)
             for i in range(len(buckets) - 1, -1, -1):
@@ -421,7 +422,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         return buckets, num_samples_per_bucket
 
     def __iter__(self):
-        # deterministically shuffle based on epoch
+        # epoch に基づいて決定論的にシャッフルする（同じ epoch なら同じ順序）
         g = torch.Generator()
         g.manual_seed(self.epoch)
 
@@ -442,7 +443,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             ids_bucket = indices[i]
             num_samples_bucket = self.num_samples_per_bucket[i]
 
-            # add extra samples to make it evenly divisible
+            # レプリカ数で均等に割り切れるよう末尾を複製して補う
             rem = num_samples_bucket - len_bucket
             ids_bucket = (
                 ids_bucket
@@ -450,10 +451,10 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                 + ids_bucket[: (rem % len_bucket)]
             )
 
-            # subsample
+            # 自分のランク分のサンプルだけ取り出す
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 
-            # batching
+            # バッチにまとめる
             for j in range(len(ids_bucket) // self.batch_size):
                 batch = [
                     bucket[idx]

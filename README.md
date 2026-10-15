@@ -20,7 +20,7 @@ uv run train_model.py -m <モデル名>       # 学習（新規も再開もこ�
 uv run app.py                            # 試聴GUI（学習済みモデルを音声合成して確認）
 ```
 
-詳しい手順（データセット契約・各ステップ・成果物・ライブラリ利用）は **[実操作ガイド docs/GUIDE.md](/docs/GUIDE.md)** を参照してください。
+詳しい手順（データセット契約・各ステップ・成果物・ライブラリ利用）は **[実操作ガイド docs/GUIDE.md](/docs/GUIDE.md)** を参照してください。ユースケース別にコマンドを引きたいときは **[チートシート](チートシート.md)** からどうぞ。
 
 ## ディレクトリ構成
 
@@ -38,5 +38,8 @@ dict_data/          pyopenjtalk ユーザー辞書
 ## ドキュメント
 
 - **[docs/GUIDE.md](/docs/GUIDE.md)** — 実操作ガイド（データセット→学習→成果物→試聴）
-- [docs/SPLIT_PLAN.md](/docs/SPLIT_PLAN.md) — 本コアの分割設計方針
+- **[チートシート.md](チートシート.md)** — ユースケース別のよく使うコマンド（新規学習・再開・設定変更・一括実行・試聴・トラブル対応）
+- [docs/TENSORBOARD.md](/docs/TENSORBOARD.md) — TensorBoard で学習状況を見るガイド（損失曲線・検証音声の聞き比べ）
+- [docs/DECISIONS.md](/docs/DECISIONS.md) — 判断の経緯（設計・既定値がなぜこうなっているかの実測つき記録）
+- [docs/SPLIT_PLAN.md](/docs/SPLIT_PLAN.md) — 本コアの分割設計方針（実施完了・歴史記録）
 - `docs/upstream/` — フォーク元リポジトリのドキュメント（歴史・アーキテクチャ背景としての参照用）
