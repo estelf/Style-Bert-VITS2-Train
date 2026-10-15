@@ -60,15 +60,13 @@ from train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
-    True  # If encontered training problem,please try to disable TF32.
+    True  # 学習が壊れる（音質ノイズ・NaN 等）場合は TF32 を無効化して確認すること
 )
 torch.set_num_threads(1)
 torch.set_float32_matmul_precision("medium")
 # torch.backends.cuda.sdp_kernel("flash") は deprecated（sdp_kernel 自体が廃止予定）。下 enable_* で同等の設定を明示する
 torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(
-    True
-)  # Not available if torch version is lower than 2.0
+torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 # 決定論モード（デフォルト OFF）。回帰テストのゴールデン音声比較時のみ環境変数 SBV2_DETERMINISTIC=1 で有効化する。
 # 本番の長時間学習では cuDNN の非決定的最適カーネルが使えるほうが速いため、常時 ON にしない。
@@ -187,6 +185,12 @@ def _validate_train_config(hps) -> None:
     if t.early_stopping_patience < 1:
         raise ValueError(
             f"train.early_stopping_patience は 1 以上が必要です（現在: {t.early_stopping_patience}）"
+        )
+    if t.early_stopping_min_steps < -1:
+        raise ValueError(
+            "train.early_stopping_min_steps は -1（自動: max(1000, 5×1エポックのstep数)、"
+            f"学習開始時に解決）、0（全履歴対象）、正の固定step数のいずれかが必要です"
+            f"（現在: {t.early_stopping_min_steps}）"
         )
     if t.early_stopping_min_delta < 0 or t.early_stopping_min_delta_rel < 0:
         raise ValueError(
@@ -436,7 +440,7 @@ def run():
             f"学習可能なデータセット: {available or 'なし（先に preprocess_all.py -m <モデル名> を実行してください）'}"
         )
 
-    # Set log file
+    # ログファイルの設定
     model_dir = os.path.join(dataset_path, "models")
     # マルチGPUでは全ランクが同じログファイルを掴んで混線するため、rank 0 だけがファイルへ書く
     # （他ランクはコンソール出力のみ。torchrun 経由ならコンソールがまとめて残る）。
@@ -449,7 +453,7 @@ def run():
             retention=10,
         )
 
-    # Parsing environment variables (デフォルトは定数。環境変数が既に設定されている場合はそれを優先)
+    # 環境変数の読み込み（デフォルトは定数。環境変数が既に設定されている場合はそれを優先）
     envs = dict(TRAIN_ENV_DEFAULTS)
     # 既定ポートの固定値は同時実行する2本目が衝突するため、未設定のときだけ空きポートを選ぶ
     # （torchrun 経由なら MASTER_PORT はランチャー側で設定されるのでここは通らない）
@@ -480,7 +484,7 @@ def run():
 
     backend = "nccl"
     if platform.system() == "Windows":
-        backend = "gloo"  # If Windows,switch to gloo backend.
+        backend = "gloo"  # Windows では gloo バックエンドへ切り替える
     # timeout: 評価ステップでは rank 0 だけが検証音声の生成＋チェックポイント4点保存を行い、
     # 他ランクは次の集合通信で待つ。検証文が多い・ディスクが遅い環境では 300 秒では足りず、
     # 学習中盤で NCCL タイムアウト落ちするため 30 分に拡大する
@@ -491,7 +495,7 @@ def run():
                 backend=backend,
                 init_method="env://",
                 timeout=datetime.timedelta(seconds=1800),
-            )  # Use torchrun instead of mp.spawn
+            )  # 分散起動は torchrun 経由（mp.spawn は使わない）
             break
         except Exception as e:
             # 空きポート選択には close してから bind までの TOCTOU の窓がある。
@@ -511,7 +515,7 @@ def run():
     torch.cuda.set_device(local_rank)
 
     hps = HyperParameters.load_from_json(config_path)
-    # This is needed because we have to pass values to `train_and_evaluate()
+    # train_and_evaluate() へ渡す必要があるため、実行ごとの値をここで hps に設定する
     hps.model_name = model_name
     hps.model_dir = model_dir
     hps.out_dir = out_dir
@@ -706,6 +710,17 @@ def run():
             logger.warning(
                 f"val.list が空のため早期停止は機能しません（epochs 上限 {hps.train.epochs} まで学習します）。"
                 "検証データを置くか、early_stopping_enabled: false を明示してください"
+            )
+    # early_stopping_min_steps=-1（自動）をデータセット規模から concrete な step 数へここで解決し、
+    # hps へ書き戻す（以降の _early_stop_check / _best_eval_entry は解決済み値だけを参照する。
+    # Data 側の config.json はユーザー指定のまま書き換えない）。各ランクが同一データセットから
+    # 同じ値を計算するので DDP でも不一致は起きない
+    if hps.train.early_stopping_min_steps < 0:
+        resolved_min_steps = _resolve_early_stopping_min_steps(hps, len(train_loader))
+        if rank == 0 and hps.train.early_stopping_enabled:
+            logger.info(
+                f"early_stopping_min_steps=auto: 学習 {len(train_dataset)} 文・"
+                f"{len(train_loader)} step/エポック → 経過 {resolved_min_steps} step 以降の評価から判定開始"
             )
     if hps.model.use_noise_scaled_mas is True:
         logger.info("Using noise scaled MAS for VITS2")
@@ -1182,7 +1197,7 @@ def run():
                 )
                 break
             if epoch == hps.train.epochs:
-                # Save the final models（保存は rank 0 のみ。他ランクが同時に同じ .pth へ
+                # 最終モデルの保存（保存は rank 0 のみ。他ランクが同時に同じ .pth へ
                 # 書くと競合して壊れる。評価ステップの保存は元々 rank 0 ガード付き）
                 if rank == 0:
                     assert optim_g is not None
@@ -1741,7 +1756,7 @@ def train_and_evaluate(
                             n_ckpts_to_keep=keep_ckpts,
                             sort_by_time=True,
                         )
-                    # Save safetensors (for inference) to `model_assets/{model_name}`
+                    # 推論用 safetensors を model_assets/{model_name} へ保存
                     saved_safetensors = os.path.join(
                         hps.out_dir,
                         f"{hps.model_name}_e{epoch}_s{global_step}.safetensors",
@@ -1876,8 +1891,8 @@ def validate_loss(hps, net_g, eval_loader, writer, wl=None):
 
     早期停止の監視指標。学習ステップと同じ forward（MAS アライメント）を使うが、評価間で値を
     比較できるようシードを固定し MAS ノイズを 0 にする。mel・kl・lm は復号音声の全文で測る
-    （学習のような segment_size スライス1点にすると、測定音が「検証件数×0.37秒」分しかなく、
-    評価ノイズが収束幅より大きくなって早期停止がコイントスになる。実測で検証4件・1σ≒0.19）。
+    （学習のような segment_size スライス1点にすると測定音が少なく、評価ノイズが収束幅より
+    大きくなって best 判定がコイントスになるため。実測値は docs/DECISIONS.md §9.2 参照）。
     検証セットの件数自体は前処理の --val_ratio（既定5%）で決まる。
     敵対損失（fm/gen/wd 系）は判別器の状態に依存して単調でなくなるため監視に使わない。
     lm（WavLM feature matching 損失）は敵対的ではない「実音声と生成音声の WavLM 特徴の距離」で、
@@ -1972,12 +1987,10 @@ def validate_loss(hps, net_g, eval_loader, writer, wl=None):
                 hps.data.mel_fmax,
             )
             # 検証は全文で測る（v2）。学習は segment_size（既定 0.37秒）のランダムスライスだが、
-            # 検証もスライス1点にすると測定される音声が「検証件数×0.37秒」分しかなく、
-            # 評価ノイズが収束幅より大きくなることを実測で確認した（検証4件・9000step のランで
-            # 評価間 1σ≒0.19 あり、best(22.6078) と停止時(22.6240) の差 0.016 を区別できない）。
-            # 全文復号は推論時の挙動そのものでもあり、スライス損失より合成品質との対応が良い。
-            # forward は z_slice（スライス）しか復号しないので、全文の後標本 z を復号し直す。
-            # no_grad・batch_size=1 なので長文でも VRAM は問題にならない。
+            # 検証もスライス1点にすると評価ノイズが収束幅より大きくなることを実測で確認した
+            # （docs/DECISIONS.md §9.2）。全文復号は推論時の挙動そのものでもあり、スライス損失より
+            # 合成品質との対応が良い。forward は z_slice（スライス）しか復号しないので、
+            # 全文の後標本 z を復号し直す。no_grad・batch_size=1 なので長文でも VRAM は問題にならない。
             # ※ forward が返す y_hat / ids_slice（スライス側）は使わない
             y_hat_full = module.dec(z, g=g)
             y_hat_mel = mel_spectrogram_torch(
@@ -2064,7 +2077,8 @@ def _best_eval_entry(
     best 選定は early_stopping_best_smooth（既定5）の窓内中央値で行う。検証損失は
     評価ノイズで数%揺れるため、単発の最小値だと「偶発的に低く出た評価」を best に
     選ぶくじ引きになる。中央値スムージングで近傍ごと安定して低い step を選び、
-    同スコアのときは生値・step 昇順（早い方）で決める。1 で従来動作（単発最小値）
+    同スコアのときは生値・step 昇順（早い方）で決める。1 で従来動作（単発最小値）。
+    min_steps の負値（-1=自動。run() で解決済みなため通常届かない）は 0 と同じく全履歴対象
     """
     key = hps.train.early_stopping_monitor
     if key not in ("mel", "dur", "kl", "lm", "total"):
@@ -2196,6 +2210,22 @@ def _save_best_checkpoint(hps, entry: dict, key: str) -> None:
                 pass
 
 
+def _resolve_early_stopping_min_steps(hps, steps_per_epoch: int) -> int:
+    """early_stopping_min_steps=-1（自動）を concrete な step 数へ解決して hps へ書き戻す。
+
+    自動値は max(1000, 5×1エポックのstep数)。5エポックとしたのは、回帰傾きがプラトー閾値を
+    大きく超える急速改善期を越えつつ、過学習が深まりすぎる前の妥協点であるため。下限 1000 は
+    極小データセットで判定窓（プラトーに評価5回分必要）が短くなりすぎるのを防ぐ。
+    旧既定の固定 3000 をやめた経緯は docs/DECISIONS.md §9.4 参照。
+    0 以上はそのまま返す（0=全履歴対象、>0=固定step数）
+    """
+    value = hps.train.early_stopping_min_steps
+    if value < 0:
+        value = max(1000, 5 * max(1, steps_per_epoch))
+        hps.train.early_stopping_min_steps = value
+    return value
+
+
 def _early_stop_check(
     history: list[dict], hps, initial_step: int, since_step: int | None = None
 ) -> tuple[bool, str]:
@@ -2204,7 +2234,8 @@ def _early_stop_check(
     - 判定開始点: early_stopping_min_steps が今回の学習開始点（再開時は再開step）から
       経過した後の評価のみを判定に使う（それ以前の履歴は best・patience・プラトー窓に
       一切数えない）。新規学習の早すぎる停止と、履歴を引き継いだ再開直後の即停止を防ぐ。
-      0 の場合は全履歴を対象にする
+      0 の場合は全履歴を対象にする。負値（-1=自動）は run() で学習開始前に concrete 値へ
+      解決済みなので通常届かないが、届いた場合は 0（全履歴対象）として扱う
     - since_step: ここ（early_stopping_action="reduce_lr" の直近削減 step 等）を
       超えた評価だけで判定する。None で無効
     - patience: best 更新（実効 min_delta 以上の改善）が無い評価が early_stopping_patience
@@ -2214,6 +2245,10 @@ def _early_stop_check(
       走り続ける（best に対する割合で見るのが ReduceLROnPlateau 等の慣習）
     - プラトー: 直近 early_stopping_plateau_window 評価の最小二乗回帰傾きの絶対値が
       |平均値| × early_stopping_plateau_slope_eps 以下なら停止（0 で無効）
+    - 悪化: 同上の窓の回帰傾きが +閾値 を超えるなら停止。悪化が明らかな学習を続けても
+      best は保存済みで得られない。|傾き|≦閾値 のみ停止だった旧実装では、ノイズ帯を
+      超えて悪化する run はプラトー判定で止まらず、評価回数の少ない小規模データセットでは
+      patience も発火しにくく epochs 上限まで走りうる（経緯は docs/DECISIONS.md §9.4）
 
     Returns:
         tuple[bool, str]: (停止すべきか, 理由)
@@ -2257,7 +2292,7 @@ def _early_stop_check(
             f"patience 超過: best({key}={best:.4f}) 更新なし（実効閾値 {max(hps.train.early_stopping_min_delta, best * hps.train.early_stopping_min_delta_rel):.4f} 未満の改善）が {counter} 評価続いています",
         )
 
-    # プラトー判定（窓内最小二乗回帰の相対傾き）
+    # プラトー・悪化判定（窓内最小二乗回帰の相対傾き）
     window = hps.train.early_stopping_plateau_window
     if window >= 3 and len(vals) >= window:
         ys = vals[-window:]
@@ -2266,6 +2301,14 @@ def _early_stop_check(
         denom = sum((x - x_mean) ** 2 for x in range(window))
         slope = sum((x - x_mean) * (y - y_mean) for x, y in enumerate(ys)) / denom
         threshold = hps.train.early_stopping_plateau_slope_eps * max(abs(y_mean), 1e-8)
+        if slope > threshold:
+            # ノイズ帯を超えた悪化。改善（slope < -閾値）でも平坦（|slope|≦閾値）でもない
+            # のは損失が上昇に転じたと見るべき状態で、best は保存済みなので続行の益がない
+            return (
+                True,
+                f"悪化検出: 直近 {window} 評価の傾き {slope:+.5f}/評価 が悪化閾値 +{threshold:.5f} を超過"
+                "（ノイズ帯を超えて悪化。best は保存済みのため続行の益なし）",
+            )
         if abs(slope) <= threshold:
             return (
                 True,

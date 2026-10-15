@@ -1,6 +1,6 @@
 # 実操作ガイド（データセット → 学習 → 成果物 → 試聴）
 
-このリポジトリはフォーク元の Style-Bert-VITS2 を日本語・JP-Extra 一本化した「学習コア」です。uv 経由で実行するので、コマンドはすべて `uv run` で実行します。トップレベルの呼び出し口は3つだけ覚えていれば大丈夫です。
+このリポジトリはフォーク元の Style-Bert-VITS2 を日本語・JP-Extra 一本化した「学習コア」です。uv 経由で実行するので、コマンドはすべて `uv run` で実行します。トップレベルの呼び出し口は3つだけ覚えていれば大丈夫です。ユースケース別のコマンドをすぐ引きたいときは [チートシート](../チートシート.md)、設計や既定値の判断の経緯（なぜこうなっているか）は [DECISIONS.md](DECISIONS.md) を参照してください。
 
 | 呼び出し口 | 役割 |
 |---|---|
@@ -100,39 +100,40 @@ BERT特徴キャッシュ（`*.bert.pt`）には生成根拠（テキスト＋wo
 
 ### 早期停止と best checkpoint の自動選定
 
-早期停止は **既定で有効** です。`eval_interval` ごとに **val.list の検証損失**（非敵対損失のみ）を計算し、以下の条件のどちらかで学習を停止します。設定は `Data/<モデル名>/config.json` の `train`（キーが無い既存 config も Pydantic 既定値で動きます）。
+早期停止は **既定で有効** です。`eval_interval` ごとに **val.list の検証損失**（非敵対損失のみ）を計算し、以下の条件（patience / プラトー / 悪化）のいずれかで学習を停止します。設定は `Data/<モデル名>/config.json` の `train`（キーが無い既存 config も Pydantic 既定値で動きます）。
 
 ```json
 "early_stopping_enabled": true,          // 既定 true。無効化すれば epochs まで回し切る
 "early_stopping_monitor": "mel",         // mel | dur | kl | lm | total（lm は WavLM 特徴一致損失。total は mel+dur+kl の和で lm を含まない）
-"early_stopping_min_steps": 3000,        // 今回の学習開始点（再開時は再開step）からこの経過step以降の評価だけを判定に使う。0 で全履歴対象
-"early_stopping_patience": 10,           // best 更新が無い評価が続いたら停止
+"early_stopping_min_steps": -1,          // 今回の学習開始点（再開時は再開step）からこの経過step以降の評価だけを判定に使う。既定 -1=自動（学習開始時にデータセット規模から max(1000, 5×1エポックのstep数) へ解決）。0 で全履歴対象
+"early_stopping_patience": 5,            // best 更新が無い評価が続いたら停止
 "early_stopping_min_delta": 0.001,       // これ未満の改善は best 更新とみなさない
 "early_stopping_min_delta_rel": 0.01,    // best に対する割合で見る閾値（1%）。実際の判定は max(min_delta, best×この値)。0 で従来動作
 "early_stopping_best_smooth": 5,         // best 選定を窓内中央値で行う幅（1 で従来動作の単発最小値）
 "early_stopping_action": "stop",         // 停止条件到達時の動作: "stop" で学習停止、"reduce_lr" で学習率を削減して続行（下記）
 "early_stopping_reduce_lr_factor": 0.5,  // action="reduce_lr" のときの学習率乗数（0〜1）
 "early_stopping_reduce_lr_times": 3,     // 学習率削減の最大回数。使い切ったら停止
-"early_stopping_plateau_window": 5,      // プラトー検出の窓（0 で無効）
-"early_stopping_plateau_slope_eps": 0.002 // 窓内回帰傾きが |平均|×この値 以下で停止
+"early_stopping_plateau_window": 5,      // プラトー・悪化検出の窓（0 で無効）
+"early_stopping_plateau_slope_eps": 0.002 // 窓内回帰傾きが |平均|×この値 以下でプラトー停止。+閾値 を超えたら悪化停止
 ```
 
 - 監視指標は TensorBoard に `val/*` として記録されます。全履歴は `models/eval_history.json` に保存されますが、**判定には `early_stopping_min_steps` 経過後の評価のみを使い**、それ以前の履歴（再開前を含む）は best・patience・プラトー窓に一切数えません
-- **検証損失は復号音声の全文で測ります**（学習のような `segment_size`＝0.37秒のスライス1点ではない）。スライス1点だと測定される音声が「検証件数×0.37秒」分しかなく、評価ノイズが収束幅より大きくなって best 判定がコイントスになるためです（実測: 検証4件・スライスの評価間 1σ≒0.19 あり、best と停止時の差 0.016 を区別できなかった）。全文評価にすると測定音は検証4件でも 1.5秒→8.1秒（5.4倍）、発話間のばらつき sd は 2.13→1.44 に低下します。`kl`・`dur` は元から全文基準、`mel`・`lm` を全文復号で測ります
-- 履歴には val.list の内容ハッシュが記録され、**検証セットを変更した場合は旧検証セット上の損失を判定から除外します**（別セットの損失と混ぜて best を誤判定しないため）。同様に測定方法のバージョン（`metric_version`。v1=スライス1点、v2=全文）も記録し、**旧測定の履歴は絶対値が別物なので判定から除外します**（v1 の 22.6 相当と v2 の 21.9 相当を同じ best 比較に使うと壊れる）
-- そのため新規・再開のどちらでも、最低 `min_steps` は学習が積まれてから判定が始まります（既定 eval_interval=1000 なら、停止最早は新規で step 8000=プラトー経路 / 14000=patience経路、step 3100 からの再開なら 11000 / 17000）
+- **検証損失は復号音声の全文で測ります**（学習のような `segment_size`＝0.37秒のスライス1点ではない）。スライス1点だと測定音声が少なく評価ノイズが収束幅より大きくなって best 判定がコイントスになるためです（実測値は [DECISIONS.md §9.2](DECISIONS.md) 参照）。`kl`・`dur` は元から全文基準、`mel`・`lm` を全文復号で測ります
+- 履歴には val.list の内容ハッシュが記録され、**検証セットを変更した場合は旧検証セット上の損失を判定から除外します**（別セットの損失と混ぜて best を誤判定しないため）。同様に測定方法のバージョン（`metric_version`。v1=スライス1点、v2=全文）も記録し、**旧測定の履歴は絶対値が別物なので判定から除外します**
+- そのため新規・再開のどちらでも、最低 `min_steps` は学習が積まれてから判定が始まります。既定 `min_steps: -1`（自動）は学習開始時にデータセット規模から `max(1000, 5×1エポックのstep数)` へ解決されます（例: 学習152文・batch_size 2 → 76 step/エポック → 下限の 1000、686文 → 343 step/エポック → 1715）。停止最早は `min_steps + プラトー窓(5)×eval_interval`（プラトー/悪化経路）または `min_steps + (patience+1)×eval_interval`（patience経路）で、既定 eval_interval=1000・解決後 min_steps=1000 なら step 6000 / 7000 から
+- **悪化検出**: プラトーと同じ窓の回帰傾きが +閾値（|平均|×`plateau_slope_eps`）を超えたら停止します。ノイズ帯を超えて損失が上昇している run は、best が保存済みでもう得るものがないため早期に打ち切ります（続行するのは傾きが −閾値 未満＝着実な改善中のときのみ）。mel 監視では横ばいに見えて kl・total だけが単調上昇する小規模データセットの過学習で特に効きます
 - 停止してもチェックポイント・safetensors は評価ステップ分まで保存済みのまま終了します
 - val.list が空（前処理で `--val_ratio 0`）の場合や `--speedup` 指定時は早期停止が機能しないため、**開始時に警告を出してから epochs 上限まで走ります**
 - 検証セットを変える（`--val_ratio` などを変えて再前処理する）と旧履歴は判定から自動除外されますが、**既存の重みは新しい検証発話を学習で見てしまっている**ため検証として成り立ちません。検証を意味のあるものにするには `preprocess_all.py --reset_models` で新規学習からやり直してください
 - 検証が20件未満の小規模データセットでは評価がノイジーです（ノイズは 1/sqrt(件数) で減る）。`--min_val` を上げるか、早すぎる停止が出るようなら patience を長め（8〜15）に、plateau_window を 0（無効）に調整してください
-- **ノイズ対策（既定動作）**: 検証損失は評価ノイズで揺れます（検証47件の全文評価で実測した評価1点の揺らぎ σ≒0.70%。検証4件なら数%）。patience の改善判定は絶対値 `min_delta` ではなく `max(min_delta, best × min_delta_rel)` の実効閾値で行い、閾値はノイズ帯より広く取ります（既定 1% ≒ 1.4σ）。これがないとノイズの偶発更新で patience が永遠に発火せず epochs 上限まで走り続けます（0.5% は 0.7σ で約4件に1件更新されていた実測あり）。best チェックポイントも単発の最小値ではなく `early_stopping_best_smooth` 窓内の中央値で選び、偶発的に低く出た評価を best にする「くじ引き」を防ぎます（既定 窓5）
+- **ノイズ対策（既定動作）**: 検証損失は評価ノイズで揺れるため（件数に依存。検証47件の全文評価で評価1点の揺らぎ σ≒0.70%、検証4件なら数%）、patience の改善判定は絶対値 `min_delta` ではなく `max(min_delta, best × min_delta_rel)` の実効閾値で行い、閾値をノイズ帯より広く取ります（既定 1% ≒ 1.4σ）。これがないとノイズの偶発更新で patience が永遠に発火せず epochs 上限まで走り続けます。best チェックポイントも単発の最小値ではなく `early_stopping_best_smooth` 窓内の中央値で選び、偶発的に低く出た評価を best にする「くじ引き」を防ぎます（既定 窓5）。実測による既定値の決め手は [DECISIONS.md §9.3](DECISIONS.md) 参照
 - **`early_stopping_action: "reduce_lr"`**: 停止条件に到達しても学習率を `reduce_lr_factor` 倍して続行する ReduceLROnPlateau 相当の動作です。削減回数は `eval_history.json` に記録され、**再開時も自動復元**されます。削減後は patience/プラトーの判定窓もリセットされ、`reduce_lr_times` を使い切った時点で停止します。DDP では全ランクへ broadcast して同一の学習率を維持します
 - **`lm` 指標**: WavLM feature matching 損失（実音声と生成音声の WavLM 特徴距離。非敵対）。mel のフレーム対応とは別軸で知覚的近さを測ります。`total` との後方互換のため `total` には含めないので、監視するなら `monitor: "lm"` を明示します（`use_wavlm_discriminator: false` の設定では計算されません）
 - 履歴エントリには現在の学習率（`lr`）と削減回数（`lr_reductions`）も記録され、reduce_lr の効果を目視確認できます
 
 監視 best（検証損失上の最良）は毎回 `models/best_checkpoint.json` に記録され、対応する実体は `model_assets/<モデル名>/best.safetensors` として1点コピーされます。`keep_safetensors` で古い eval 資産を間引いても best の実体は残ります。
 
-**best step の選定は通常重みで検証損失を実測して行いますが、`best.safetensors` として書き出す1点は既定で EMA 重みです**（`best_use_ema: true`）。同一 step の通常/EMA 比較で EMA 側が合成品質に優位だったためです（実測run 実測: 評価8候補すべてで UTMOS が上・平均 +0.27、`mel_corr` も 7/8 で上）。検証を実測した通常重みは `<モデル名>_e<epoch>_s<step>.safetensors` にそのまま残るので、聞き比べ・`select_best.py` の候補は従来どおり両方あります。`best_checkpoint.json` の `weights` キーが `best.safetensors` の中身（`ema` / `normal`）、`safetensors` / `safetensors_ema` が両実体のファイル名です。EMA 実体が無い step（`ema_decay: 0` など）は自動的に通常重みへフォールバックします。
+**best step の選定は通常重みで検証損失を実測して行いますが、`best.safetensors` として書き出す1点は既定で EMA 重みです**（`best_use_ema: true`）。同一 step の通常/EMA 比較で EMA 側が合成品質に優位だったためです（実測は [DECISIONS.md §9.5](DECISIONS.md) 参照）。検証を実測した通常重みは `<モデル名>_e<epoch>_s<step>.safetensors` にそのまま残るので、聞き比べ・`select_best.py` の候補は従来どおり両方あります。`best_checkpoint.json` の `weights` キーが `best.safetensors` の中身（`ema` / `normal`）、`safetensors` / `safetensors_ema` が両実体のファイル名です。EMA 実体が無い step（`ema_decay: 0` など）は自動的に通常重みへフォールバックします。
 
 学習中に `model_assets/<モデル名>/` へ溜まった `<モデル名>_e<epoch>_s<step>.safetensors` 群から推論に使いたい1点を選ぶには、品質メトリクスでの評価スクリプトを使います。
 
@@ -154,7 +155,7 @@ uv run -m train.select_best -m <モデル名> [--utmos] [--spk-sim] [--stride N]
 "adversarial_warmup_steps": 0,    // 敵対損失（fm/gen/dur_gen/lm 系）を学習開始から線形に 0→1 スケールするステップ数。判別器未熟期の暴れ防止。0 で無効
 "ema_decay": 0.999,               // 生成器パラメータの EMA 減衰率（0 で無効）。評価・最終保存に `<モデル名>_e<epoch>_s<step>_ema.safetensors` が併記される。早期停止の判定は検証損失を実測している通常重み側で行う
 "best_use_ema": true,             // best.safetensors を best step の EMA 重みからコピーする（best step の選定は通常重みの検証損失のまま）。false で従来動作＝検証を実測した通常重みをコピー
-"keep_safetensors": 12,           // model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し（best.safetensors と best の step は常に保持）。eval_interval=1000 ごとに通常+EMA の2枚（約500MB）増えるため、長期学習の disk 圧迫を防ぐ
+"keep_safetensors": 6,            // model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し（best.safetensors と best の step は常に保持）。eval_interval=1000 ごとに通常+EMA の2枚（約500MB）増えるため、長期学習の disk 圧迫を防ぐ
 "nan_guard_max_skips": 10         // 非有限損失（NaN/inf）がこの回数連続で出たら学習停止。発生前の重みは保持され、検出ステップは更新をスキップ。0 で無効
 ```
 

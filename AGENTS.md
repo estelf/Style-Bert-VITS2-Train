@@ -1,6 +1,6 @@
 # AGENTS.md
 
-日本語・JP-Extra 一本化の Style-Bert-VITS2 学習コア（フォーク）。詳細は [docs/GUIDE.md](docs/GUIDE.md)、分割設計は docs/SPLIT_PLAN.md を参照。コメント・ドキュメントは日本語で書かれている。
+日本語・JP-Extra 一本化の Style-Bert-VITS2 学習コア（フォーク）。詳細は [docs/GUIDE.md](docs/GUIDE.md)、分割設計は docs/SPLIT_PLAN.md（歴史記録）、設計・既定値の判断の経緯は docs/DECISIONS.md を参照（既定値や設計を変える前に読む。ユースケース別コマンドはルートの チートシート.md）。コメント・ドキュメントは日本語で書かれている。
 
 ## 実行系の基本
 

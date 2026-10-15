@@ -26,6 +26,8 @@ def summarize(
     histograms: dict[str, Any] = {},
     images: dict[str, Any] = {},
     audios: dict[str, Any] = {},
+    # 既定値は上流 VITS 由来の 22050 のまま（このフォークの音声は全て 44100 なので、
+    # 呼び出し側は必ず hps.data.sampling_rate を明示すること。train/pipeline.py の全呼び出しが明示している）
     audio_sampling_rate: int = 22050,
 ) -> None:
     """
