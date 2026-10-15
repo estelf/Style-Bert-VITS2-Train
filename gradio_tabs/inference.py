@@ -28,7 +28,8 @@ pyopenjtalk.initialize_worker()
 
 # GUI 起動時に BERT モデルをロードしない（重い試聴GUIを軽く保つため）
 # データセットの BERT 特徴量は前処理で `preprocess.bert_gen` が既に抽出済みなので、試聴時に別途ロードするだけでよい
-# BERT モデルのロードは「ロード」ボタン押下時に実行される TTSModelHolder.get_model_for_gradio() 内で行われる
+# BERT モデルも合成モデル（net_g）も遅延ロードで、初回の音声合成時に TTSModel.infer() 内（extract_bert_feature →
+# bert_models.load_model / net_g の get_net_g）でロードされる。「ロード」ボタン時点では TTSModel の構築のみ行う
 
 initial_text = "こんにちは、初めまして。あなたの名前はなんていうの？"
 
@@ -153,7 +154,7 @@ model_assets
 - `*.safetensors`：学習済みモデルファイル（1つ以上が必要、複数可）
 - `style_vectors.npy`：スタイルベクトルファイル
 
-上2つは`uv run train_model.py -m <モデル名>`による学習で自動的に正しい位置に保存されます。`style_vectors.npy` は前処理（`uv run preprocess_all.py -m <モデル名>` の Step 6、または `uv run -m preprocess.style_gen --model_name <モデル名>`）で生成されます。
+上2つは`uv run train_model.py -m <モデル名>`による学習で自動的に正しい位置に保存されます。`style_vectors.npy` も学習開始時に自動生成されます（前処理 Step 6 `preprocess_all.py` が音声ごとに作ったスタイル特徴 `wavs/*.flac.npy` を、学習開始時に `train_model.py` が集約して作ります）。
 """
 
 style_md = f"""

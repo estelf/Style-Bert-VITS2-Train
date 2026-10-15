@@ -27,7 +27,7 @@ def _init_pyopenjtalk_worker() -> None:
     update_dict()
 
 
-# Count lines for tqdm
+# tqdm 進捗表示のための行数カウント
 def count_lines(file_path: Path):
     with file_path.open("r", encoding="utf-8") as file:
         return sum(1 for _ in file)
