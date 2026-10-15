@@ -52,13 +52,14 @@ uv run tensorboard --logdir Data/<モデル名>/models
 
 ### 検証損失（早期停止の監視指標）
 
-`eval_interval` ごとに val.list（held-out 発話）で計算される非敵対損失。敵対損失と違い判別器の状態に依存しないので、**学習の進み・過学習の判定はこっちを見る**（train.list 側と発話が異なるため絶対値は train より高めに出る）。
+`eval_interval` ごとに val.list（held-out 発話。件数は前処理の `--val_ratio`（既定5%）で決まる）で計算される非敵対損失です。敵対損失と違い判別器の状態に依存しないので、**学習の進み・過学習の判定はこっちを見る**（train.list 側と発話が異なるため絶対値は train より高めに出る）。
 
 | タグ | 意味 |
 |---|---|
-| `val/mel` | 検証データのスペクトログラムL1誤差（c_mel 加重）。早期停止の既定監視対象 |
-| `val/dur` / `val/kl` | 検証データの音素長回帰誤差 / KL 正則化項 |
-| `val/total` | 上の3つの合計 |
+| `val/mel` | 検証データのスペクトログラムL1誤差（c_mel 加重）。**復号音声の全文で測定**（学習のような 0.37秒スライス1点ではない）。早期停止の既定監視対象 |
+| `val/dur` / `val/kl` | 検証データの音素長回帰誤差 / KL 正則化項（どちらも全文基準） |
+| `val/lm` | 検証データの WavLM feature matching 損失（実音声と生成音声の WavLM 特徴距離。非敵対）。mel のフレーム対応とは別軸で知覚的近さを測る。`use_wavlm_discriminator: false` では出ない |
+| `val/total` | mel + dur + kl の合計（後方互換のため lm は含まない。lm を監視したい場合は早期停止の `monitor: "lm"` を明示する） |
 
 `val/mel` が train 側は下がり続けているのに横ばい・上昇に転じたら過学習の兆候。早期停止は既定で有効で、設定とプラトー検出は [GUIDE.md](GUIDE.md) の「早期停止と best checkpoint の自動選定」参照（履歴は `models/eval_history.json` にも残る）。
 

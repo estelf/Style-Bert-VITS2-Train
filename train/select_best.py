@@ -1,13 +1,16 @@
 """学習中に model_assets/<モデル名>/ へ溜まる .safetensors を品質メトリクスで評価し、best checkpoint を選ぶ。
 
 使い方:
-    uv run -m train.select_best -m <モデル名> [--utmos] [--spk-sim] [--device cuda|cpu] [--style Neutral]
+    uv run -m train.select_best -m <モデル名> [--utmos] [--spk-sim] [--device cuda|cpu] [--style Neutral] [--stride N] [--len-norm]
 
 メトリクス（val.list の文をシード固定42で合成して計算。回帰テストと同じ慣習）:
-    - mel_corr: 正解音声（val.list の wav）との log-mel スペクトログラム相関。追加依存ゼロ
+    - mel_corr: 正解音声（val.list の wav）との log-mel スペクトログラム相関。追加依存ゼロ。
+      既定は発話長がずれると下がる仕様なので、長さ差を無視して形状だけ見たいときは --len-norm
     - utmos:    UTMOS22 による MOS 予測（torch.hub 経由。--utmos 指定時のみ、初回はネットワーク必要）
     - spk_sim:  合成音声と正解音声の話者埋め込み（pyannote wespeaker）の cos 類似度。
                 --spk-sim 指定時のみ。Hugging Face トークンが必要
+
+候補が多い長期学習では --stride N で間引ける（最新 step は必ず評価対象。評価時間は候補数に比例）
 
 早期停止（train/pipeline.py の early_stopping_*）と組み合わせ、停止後に全候補を評価して
 推論に使う1点を選ぶ運用を想定する。早期停止が記録した models/best_checkpoint.json
@@ -24,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 import torchaudio.functional as AF
 
 from style_bert_vits2.constants import ASSETS_ROOT, DATASET_ROOT
@@ -66,6 +70,20 @@ def parse_args():
         action="store_true",
         help="話者類似度（pyannote wespeaker 埋め込みの cos 類似度）も計算する（Hugging Face トークンとモデル同意が必要）",
     )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="N 件おきに .safetensors を間引いて評価する（最終 step は必ず含める。"
+        "eval_interval=1000 の長期学習で候補が数百個溜まったときの評価時間を短縮する。既定 1=全件）",
+    )
+    parser.add_argument(
+        "--len-norm",
+        action="store_true",
+        help="mel_corr を比較前に両 log-mel を時間軸線形補間で同一フレーム数へ揃えて計算する。"
+        "既定の mel_corr は発話長がずれると（無音の長さ差だけでも）不利に下がるため、"
+        "スペクトル軌道の形状だけを比較したいときに有効",
+    )
     return parser.parse_args()
 
 
@@ -90,19 +108,50 @@ def logmel(x: torch.Tensor, sr: int) -> torch.Tensor:
 
 
 def mel_correlation(
-    gen_int16: np.ndarray, gen_sr: int, gt: np.ndarray, gt_sr: int
+    gen_int16: np.ndarray,
+    gen_sr: int,
+    gt: np.ndarray,
+    gt_sr: int,
+    len_norm: bool = False,
 ) -> float:
-    """合成音声と正解音声の log-mel 相関。発話長がずれると下がる粗い指標である点は留意"""
+    """合成音声と正解音声の log-mel 相関。
+
+    len_norm=False（既定）は時間軸を先頭から重ねて共通部分を比較する粗い指標で、
+    発話長がずれると（無音の長さ差だけでも）下がる。len_norm=True は両者を同一
+    フレーム数へ線形補間してから比較するため、長さ差のペナルティを受けず
+    スペクトル軌道の形状だけを見る（比較用途として頑健な代わりに、
+    生成が極端に短い/長いといった劣化は検出できなくなる点に注意）
+    """
     g = torch.tensor(gen_int16.astype(np.float32) / 32768.0)[None]
     t = torch.tensor(gt.astype(np.float32))[None]
     if gt_sr != gen_sr:
         t = AF.resample(t, gt_sr, gen_sr)
     mg, mt = logmel(g, gen_sr), logmel(t, gen_sr)
+    if len_norm:
+        # 時間軸（最終次元）を短い側へ揃えて線形補間。[1, mel, T] 形のまま interpolate
+        n = min(mg.shape[-1], mt.shape[-1])
+        if n >= 2:
+            mg = F.interpolate(mg, size=n, mode="linear", align_corners=False)
+            mt = F.interpolate(mt, size=n, mode="linear", align_corners=False)
     n = min(mg.shape[-1], mt.shape[-1])
     a, b = mg[..., :n].flatten().numpy(), mt[..., :n].flatten().numpy()
     if a.size == 0 or np.std(a) < 1e-8 or np.std(b) < 1e-8:
         return 0.0
     return float(np.corrcoef(a, b)[0, 1])
+
+
+def select_checkpoints(ckpts: list[Path], stride: int) -> list[Path]:
+    """stride 件おきに候補を間引く（step 昇順を前提に、末尾＝最新は必ず残す）。
+
+    stride<=1 は全件。間引いても best_selection.json の比較は「同一条件の候補同士」で
+    行われるため順位判定の趣旨は保たれる（評価時間を候補数に比例して短縮できる）
+    """
+    if stride <= 1 or len(ckpts) <= stride:
+        return list(ckpts)
+    kept = ckpts[::stride]
+    if kept[-1] != ckpts[-1]:
+        kept.append(ckpts[-1])
+    return kept
 
 
 def load_utmos(device: str):
@@ -198,7 +247,8 @@ def main():
         evals.append({"wav": parts[0], "spk": parts[1], "text": parts[3]})
     if not evals:
         sys.exit(
-            f"val.list が空です: {val_path}（前処理を val_per_lang > 0 で実行してください）"
+            f"val.list が空です: {val_path}"
+            "（前処理を --val_ratio 0 で実行していないか、--val_ratio を上げて再前処理してください）"
         )
 
     style = args.style or (
@@ -211,6 +261,15 @@ def main():
     )
     if not ckpts:
         sys.exit(f"{assets_dir} に .safetensors がありません")
+    if args.stride < 1:
+        sys.exit(f"--stride は 1 以上を指定してください（現在: {args.stride}）")
+    n_before = len(ckpts)
+    ckpts = select_checkpoints(ckpts, args.stride)
+    if len(ckpts) < n_before:
+        logger.info(
+            f"--stride {args.stride} により候補を {n_before} → {len(ckpts)} 件へ間引きました"
+            "（最新 step は必ず評価対象に含まれます）"
+        )
 
     utmos_model = load_utmos(device) if args.utmos else None
     spk_inference = load_speaker_inference() if args.spk_sim else None
@@ -247,7 +306,7 @@ def main():
             gt, gt_sr = sf.read(ev["wav"], dtype="float32")
             if gt.ndim > 1:
                 gt = gt.mean(axis=1)
-            corrs.append(mel_correlation(audio, sr, gt, gt_sr))
+            corrs.append(mel_correlation(audio, sr, gt, gt_sr, len_norm=args.len_norm))
             if utmos_model is not None:
                 scores.append(utmos_score(utmos_model, audio, sr, device))
             if spk_inference is not None:
@@ -293,6 +352,9 @@ def main():
         "style": style,
         "sdp_ratio": args.sdp_ratio,
         "seed": SEED,
+        "stride": args.stride,
+        "len_norm": args.len_norm,
+        "n_candidates": len(ckpts),
         "metrics": metrics,
         "best_checkpoint": best["checkpoint"],
         "early_stopping_best": monitor_best,

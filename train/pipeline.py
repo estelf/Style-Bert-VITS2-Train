@@ -3,11 +3,13 @@ import datetime
 import gc
 import hashlib
 import json
+import math
 import os
 import platform
 import re
 import shutil
 import socket
+import statistics
 import sys
 from contextlib import ExitStack
 from pathlib import Path
@@ -25,7 +27,10 @@ from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
 from style_bert_vits2.constants import (
     ASSETS_ROOT,
     BASE_DIR,
+    BUCKET_BOUNDARIES,
     DATASET_ROOT,
+    MAX_SPEC_FRAMES,
+    MIN_SPEC_FRAMES,
     TRAIN_ENV_DEFAULTS,
 )
 from style_bert_vits2.logging import logger
@@ -75,6 +80,9 @@ DETERMINISTIC = os.environ.get("SBV2_DETERMINISTIC", "0") == "1"
 if DETERMINISTIC:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+# global_step はオプティマイザ更新数ではなくマイクロバッチ（forward-backward）回数を数える。
+# accumulation_steps > 1 の実行では eval_interval / early_stopping_min_steps などのステップ基準も
+# すべてマイクロバッチ単位になる（実オプティマイザ更新数は global_step / accumulation_steps）
 global_step = 0
 
 # 検証損失の履歴（eval_history.json と同期。早期停止の判定に使う。global_step と同じく
@@ -83,6 +91,12 @@ _eval_history: list[dict] = []
 
 # 今回の val.list のハッシュ（早期停止履歴の検証セット同一性判定用。run() で設定）
 _val_hash: str | None = None
+
+# 検証損失の測定方法のバージョン（eval_history.json の metric_version に書き込む）。
+# v1 = segment_size スライス1点を測定、v2 = 復号音声の全文を測定。
+# 絶対値も評価ノイズ量も別物なので、旧バージョンの履歴を同じ best 判定に混ぜると
+# 「旧: スライス / 新: 全文」の取り比べになり早期停止が壊れる。run() の読み込みで除外する
+_VAL_METRIC_VERSION = 2
 
 # 生成器の EMA 状態（パラメータ名 → float32 テンソル）。ema_decay > 0 のとき rank 0 だけが保持する
 _ema_state: dict[str, torch.Tensor] | None = None
@@ -93,13 +107,27 @@ _nan_skip_count = 0
 # best.safetensors へコピー済みの best step（同じ best のたびに ~120MB コピーし直さないため）
 _best_copied_step: int | None = None
 
+# early_stopping_action="reduce_lr" の学習率削減状態（run() で初期化・履歴から復元し、
+# train_and_evaluate の評価ステップで更新する）。_lr_reduced_step は直近の削減 step で、
+# 削減後の評価だけを patience/プラトー判定に使うための境界になる
+_lr_reduce_count = 0
+_lr_reduced_step: int | None = None
+
+
+def _ipv6_available() -> bool:
+    """IPv6 ソケットを作れるか（ループバック ::1 が使える環境かの判定）"""
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+        return True
+    except OSError:  # IPv6 無効環境
+        return False
+
 
 def _free_port() -> str:
     """空きポートを選ぶ（既定ポート固定だと同時実行する2本目が衝突するため）"""
-    try:
+    if _ipv6_available():
         family, bind_addr = socket.AF_INET6, "::1"
-        socket.socket(family, socket.SOCK_STREAM).close()
-    except OSError:  # IPv6 無効環境では IPv4 ループバックで代替
+    else:  # IPv6 無効環境では IPv4 ループバックで代替
         family, bind_addr = socket.AF_INET, "127.0.0.1"
     with socket.socket(family, socket.SOCK_STREAM) as s:
         s.bind((bind_addr, 0))
@@ -137,7 +165,53 @@ def _validate_train_config(hps) -> None:
         raise ValueError(
             f"train.ema_decay は 0（無効）または 0〜1 の実数が必要です（現在: {t.ema_decay}）"
         )
-    if t.early_stopping_monitor not in ("mel", "dur", "kl", "total"):
+    if t.batch_size < 1:
+        raise ValueError(
+            f"train.batch_size は 1 以上が必要です（現在: {t.batch_size}）"
+        )
+    if t.epochs < 1:
+        raise ValueError(f"train.epochs は 1 以上が必要です（現在: {t.epochs}）")
+    if t.num_workers < 0:
+        raise ValueError(
+            f"train.num_workers は 0 以上が必要です（現在: {t.num_workers}。0 でメインプロセス読み込み）"
+        )
+    if t.learning_rate <= 0:
+        raise ValueError(
+            f"train.learning_rate は 0 より大きい値が必要です（現在: {t.learning_rate}）"
+        )
+    if hps.data.hop_length <= 0 or t.segment_size % hps.data.hop_length != 0:
+        raise ValueError(
+            f"train.segment_size は data.hop_length（{hps.data.hop_length}）の整数倍が必要です"
+            f"（現在: {t.segment_size}）"
+        )
+    if t.early_stopping_patience < 1:
+        raise ValueError(
+            f"train.early_stopping_patience は 1 以上が必要です（現在: {t.early_stopping_patience}）"
+        )
+    if t.early_stopping_min_delta < 0 or t.early_stopping_min_delta_rel < 0:
+        raise ValueError(
+            "train.early_stopping_min_delta / early_stopping_min_delta_rel は"
+            f"0 以上が必要です（現在: {t.early_stopping_min_delta}, {t.early_stopping_min_delta_rel}）"
+        )
+    if t.early_stopping_plateau_window != 0 and t.early_stopping_plateau_window < 3:
+        raise ValueError(
+            "train.early_stopping_plateau_window は 0（無効）または 3 以上が必要です"
+            f"（現在: {t.early_stopping_plateau_window}。回帰傾きの推定に3点以上必要）"
+        )
+    if t.early_stopping_action not in ("stop", "reduce_lr"):
+        raise ValueError(
+            f"train.early_stopping_action は 'stop' または 'reduce_lr' のいずれかが必要です"
+            f"（現在: {t.early_stopping_action!r}）"
+        )
+    if not (0 < t.early_stopping_reduce_lr_factor < 1):
+        raise ValueError(
+            f"train.early_stopping_reduce_lr_factor は 0〜1 の実数が必要です（現在: {t.early_stopping_reduce_lr_factor}）"
+        )
+    if t.early_stopping_reduce_lr_times < 0:
+        raise ValueError(
+            f"train.early_stopping_reduce_lr_times は 0 以上が必要です（現在: {t.early_stopping_reduce_lr_times}）"
+        )
+    if t.early_stopping_monitor not in ("mel", "dur", "kl", "lm", "total"):
         logger.warning(
             f"early_stopping_monitor='{t.early_stopping_monitor}' は不明です。'mel' に正規化します"
         )
@@ -209,16 +283,18 @@ def _clean_safetensors(
 
 
 def _filter_eval_dataset(eval_dataset, min_frames: int, max_frames: int) -> int:
-    """評価データセットから [min_frames, max_frames]（spec フレーム数）外のサンプルを in-place で除外し、件数を返す。
+    """評価データセットから (min_frames, max_frames]（spec フレーム数。下限排他的）外のサンプルを in-place で除外し、件数を返す。
 
-    学習のバケット除外（DistributedBucketSampler の boundaries [32, 1000]）と同じ基準。
-    長尺サンプルが評価に残っていると evaluate() の infer(max_len=1000) で生成音声だけが
-    約 11.6 秒に打ち切られ、フル長の gt/audio_ と比較できない（TensorBoard の音声プレビューが
-    意味をなさない）。また早期停止の val 損失に学習で一切使われないサンプルが混ざらないようにする
+    学習のバケット除外（DistributedBucketSampler の _bisect は「境界 < 長さ」の strict 比較で
+    MIN_SPEC_FRAMES < 長さ <= MAX_SPEC_FRAMES を保持）と同じ基準。ちょうど下限フレーム数の
+    サンプルも学習では使われないので評価からも外す（基準を揃えないと、学習で一切使われない
+    サンプルの損失が早期停止の判定に混ざる）。長尺サンプルが評価に残っていると evaluate() の
+    infer(max_len=1000) で生成音声だけが約 11.6 秒に打ち切られ、フル長の gt/audio_ と比較できない
+    （TensorBoard の音声プレビューが意味をなさない）
     """
     keep_entries, keep_lengths = [], []
     for entry, length in zip(eval_dataset.audiopaths_sid_text, eval_dataset.lengths):
-        if min_frames <= length <= max_frames:
+        if min_frames < length <= max_frames:
             keep_entries.append(entry)
             keep_lengths.append(length)
     dropped = len(eval_dataset.audiopaths_sid_text) - len(keep_entries)
@@ -257,6 +333,46 @@ def _save_ema_safetensors(net_g, epoch: int, path: str) -> None:
         with torch.no_grad():
             for n, p in module.named_parameters():
                 p.copy_(backup[n])
+
+
+def _reduce_lr(schedulers: list, factor: float) -> None:
+    """プラトー時の学習率削減（ReduceLROnPlateau 相当）。
+
+    LambdaLR は scheduler.step() ごとに lr = base_lrs × λ(epoch) を再計算するため、
+    param_groups["lr"] だけ掛けると次回エポック境界で元のカードルに巻き戻る。
+    base_lrs 自体をスケールして削減をエポックをまたいで永続化し、現在の lr も
+    即時に下げる（全ランクが同一の factor で呼ぶこと。ランク間で LR がズレると
+    DDP 学習が壊れるため、呼出は必ず broadcast 後の全ランク同期点から行う）。
+
+    再開時の復元（run() 側）でも同じく両方へ factor^prior を掛ける。torch の
+    LRScheduler は last_epoch>=0 で構築されたとき param_groups["lr"] を
+    base_lrs × λ から再計算して上書きする（公式 docstring の警告どおり）。
+    pipeline は optimizer 読込後にスケジューラを構築するため、optimizer 状態の
+    削減済み lr は構築で失われ「削減前のカードル」に落ちる。base_lrs の出典である
+    initial_lr は _reduce_lr で変更しないので、構築後の base_lrs・lr ともに
+    未削減（=config 値基準）であり、両方へ factor^prior を掛けることで正確に
+    復元される（torch 2.14 で実測確認済み）
+    """
+    for scheduler in schedulers:
+        if scheduler is None:
+            continue
+        scheduler.base_lrs = [base * factor for base in scheduler.base_lrs]
+        for pg in scheduler.optimizer.param_groups:
+            pg["lr"] *= factor
+
+
+def _apply_lr_reduction(hps, schedulers: list) -> None:
+    """broadcast 到達後、全ランクで学習率削減を実行し削減状態も更新する。
+
+    _lr_reduced_step（直近の削減 step）は patience/プラトー判定の窓の開始点になる。
+    削減評価に書き込まれた eval_history エントリには削減「前」の回数が残るため、
+    再開時の復元（run() 側）は「カウントが prior-1 だった最後の評価 step」を
+    削減発生点とみなす
+    """
+    global _lr_reduce_count, _lr_reduced_step
+    _reduce_lr(schedulers, hps.train.early_stopping_reduce_lr_factor)
+    _lr_reduce_count += 1
+    _lr_reduced_step = global_step
 
 
 def run():
@@ -302,14 +418,36 @@ def run():
     config_path = str(DATASET_ROOT / model_name / "config.json")
     out_dir = str(ASSETS_ROOT / model_name)
 
+    # -m の打ち間違いで存在しないモデル名を渡されたら、ログ出力より前に候補を挙げて失敗する。
+    # このチェックがないと loguru が Data/<打ち間違い名>/ を自動作成し、空のゴミディレクトリと
+    # train_*.log が残って後から片付けるはめになる（前処理は preprocess_all.py が作る）
+    if not Path(config_path).is_file():
+        available = (
+            sorted(
+                p.name
+                for p in DATASET_ROOT.iterdir()
+                if p.is_dir() and (p / "config.json").is_file()
+            )
+            if DATASET_ROOT.is_dir()
+            else []
+        )
+        sys.exit(
+            f"{config_path} が見つかりません。モデル名（-m {model_name!r}）を確認してください。"
+            f"学習可能なデータセット: {available or 'なし（先に preprocess_all.py -m <モデル名> を実行してください）'}"
+        )
+
     # Set log file
     model_dir = os.path.join(dataset_path, "models")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     # マルチGPUでは全ランクが同じログファイルを掴んで混線するため、rank 0 だけがファイルへ書く
-    # （他ランクはコンソール出力のみ。torchrun 経由ならコンソールがまとめて残る）
+    # （他ランクはコンソール出力のみ。torchrun 経由ならコンソールがまとめて残る）。
+    # ファイル名の日時は loguru の {time} マクロ（Python 側で整形した文字列だと loguru が
+    # パターンを認識できず retention が効かない）。実行のたびに増え続けないよう直近10本だけ保持
     rank_for_log = int(os.environ.get("RANK", TRAIN_ENV_DEFAULTS["RANK"]))
     if rank_for_log == 0:
-        logger.add(os.path.join(dataset_path, f"train_{timestamp}.log"))
+        logger.add(
+            os.path.join(dataset_path, "train_{time:YYYYMMDD_HHmmss}.log"),
+            retention=10,
+        )
 
     # Parsing environment variables (デフォルトは定数。環境変数が既に設定されている場合はそれを優先)
     envs = dict(TRAIN_ENV_DEFAULTS)
@@ -318,6 +456,14 @@ def run():
     picked_port = "MASTER_PORT" not in os.environ
     if picked_port:
         envs["MASTER_PORT"] = _free_port()
+    # MASTER_ADDR の既定 "::1" は WSL2 mirrored mode 対策のリテラルだが、IPv6 自体が使えない
+    # 環境では待ち受けに失敗する。_free_port は IPv4 にフォールバックするのにアドレスが ::1 のままだと
+    # 不整合になるため、IPv6 不可のときだけ 127.0.0.1 に落とす（明示的な環境変数があればそれを尊重）
+    if "MASTER_ADDR" not in os.environ and not _ipv6_available():
+        envs["MASTER_ADDR"] = "127.0.0.1"
+        logger.warning(
+            "IPv6 ループバック (::1) が使えないため MASTER_ADDR を 127.0.0.1 にフォールバックします"
+        )
     for env_name, env_value in envs.items():
         if env_name not in os.environ.keys():
             logger.info(f"Loading configuration from config {env_value!s}")
@@ -392,6 +538,23 @@ def run():
                 config_path=config_path,
                 config_output_path=os.path.join(out_dir, "config.json"),
             )
+            # --styles_by_dirs はスタイル資産が存在すれば再生成されず黙って無視される。
+            # フラグの意味が実行ごとに変わっていても気づけないため、既存資産のスタイル数と
+            # 照合して食い違いだけを警告する（一致していれば何も出さない）
+            try:
+                out_config = json.loads(
+                    (Path(out_dir) / "config.json").read_text(encoding="utf-8")
+                )
+                num_styles = int(out_config.get("data", {}).get("num_styles", 1))
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                num_styles = 1
+            if args.styles_by_dirs and num_styles <= 1:
+                logger.warning(
+                    "--styles_by_dirs を指定しましたが、既存のスタイル資産（Neutral 1本）が"
+                    "そのまま使われます（再開時はスタイル生成がスキップされるため）。反映するには "
+                    f"{out_dir}/style_vectors.npy を削除して再実行してください（既存 .safetensors と"
+                    "スタイル ID がずれないよう、スタイル構成を変えたら学習のやり直しを推奨します）"
+                )
         else:
             # 既定は Neutral 1本のみ（train.list / val.list の発話が算出対象）。サブディレクトリごとのスタイル生成は --styles_by_dirs のときだけ
             default_style.save_style_vectors(
@@ -425,10 +588,13 @@ def run():
     )
     collate_fn = TextAudioSpeakerCollate()
     if not args.not_use_custom_batch_sampler:
+        # バケット境界は constants の単一ソースを参照。DistributedBucketSampler は空バケット
+        # 除去で受け取ったリストを pop で破壊するため、必ずコピーを渡す（定数本体が汚染されると
+        # 同一プロセスで複数回学習するテストや再開時に境界が欠ける）
         train_sampler = DistributedBucketSampler(
             train_dataset,
             hps.train.batch_size,
-            [32, 300, 400, 500, 600, 700, 800, 900, 1000],
+            list(BUCKET_BOUNDARIES),
             num_replicas=n_gpus,
             rank=rank,
             shuffle=True,
@@ -443,7 +609,9 @@ def run():
             collate_fn=collate_fn,
             batch_sampler=train_sampler,
             # batch_size=hps.train.batch_size,
-            persistent_workers=True,
+            # persistent_workers は num_workers>0 のときだけ有効にできる（0 で True にすると
+            # DataLoader 構築時に ValueError）。num_workers=0 はメインプロセス読み込み
+            persistent_workers=hps.train.num_workers > 0,
             # これもメモリ消費量を減らそうとしてコメントアウト
             # prefetch_factor=6,
         )
@@ -489,7 +657,8 @@ def run():
             collate_fn=collate_fn,
             sampler=train_sampler,
             batch_size=hps.train.batch_size,
-            persistent_workers=True,
+            # persistent_workers は num_workers>0 のときだけ（上のバケットサンプラー側と同じ理由）
+            persistent_workers=hps.train.num_workers > 0,
             # これもメモリ消費量を減らそうとしてコメントアウト
             # prefetch_factor=6,
         )
@@ -505,14 +674,17 @@ def run():
         eval_dataset = TextAudioSpeakerLoader(
             hps.data.validation_files, hps.data, spec_cache=hps.train.spec_cache
         )
-        # 評価も学習バケット [32, 1000] フレームと同じ基準で除外する。長尺サンプルが
-        # 残ると TensorBoard の音声プレビューで生成だけが max_len=1000 に打ち切られ、
-        # フル長の gt と比較できない（早期停止の val 損失から学習不能サンプルを外す意味もある）
-        n_eval_dropped = _filter_eval_dataset(eval_dataset, 32, 1000)
+        # 評価も学習バケットと同じ基準（MIN < フレーム数 <= MAX。下限排他はサンプラーの
+        # strict 比較と揃えた）で除外する。長尺サンプルが残ると TensorBoard の音声プレビューで
+        # 生成だけが max_len=1000 に打ち切られ、フル長の gt と比較できない。
+        # 早期停止の val 損失から学習で一切使われないサンプルを外す意味もある
+        n_eval_dropped = _filter_eval_dataset(
+            eval_dataset, MIN_SPEC_FRAMES, MAX_SPEC_FRAMES
+        )
         if n_eval_dropped > 0:
             logger.warning(
-                f"val.list のうち {n_eval_dropped} 件が評価バケット範囲 [32, 1000] フレーム外のため"
-                "評価から除外します（生成音声が max_len=1000 で打ち切られ gt と比較できないため）"
+                f"val.list のうち {n_eval_dropped} 件が評価バケット範囲 ({MIN_SPEC_FRAMES}, {MAX_SPEC_FRAMES}] "
+                "フレーム外のため評価から除外します（生成音声が max_len=1000 で打ち切られ gt と比較できないため）"
             )
         eval_loader = DataLoader(
             eval_dataset,
@@ -644,26 +816,35 @@ def run():
         )
     else:
         optim_wd = None
+    # gradient_as_bucket_view: 勾配を allreduce バッファの実体（ビュー）に共有させ、
+    # バケットコピー分の VRAM を節約する。ビューが壊れるので zero_grad は必ず
+    # set_to_none=False（ゼロ埋め）で呼ぶこと（train_and_evaluate 側参照。torch の
+    # DDP ドキュメントも detach_ 不可の代替として set_to_none=False を案内している。
+    # 本リポジトリに detach_() の呼び出しはないことは確認済み）
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
+        gradient_as_bucket_view=True,
         # bucket_cap_mb=512
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
+        gradient_as_bucket_view=True,
         # bucket_cap_mb=512
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
+            gradient_as_bucket_view=True,
             # bucket_cap_mb=512,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
+            gradient_as_bucket_view=True,
             #  bucket_cap_mb=512
         )
 
@@ -858,8 +1039,13 @@ def run():
     if rank == 0 and history_path.is_file():
         try:
             entries = json.loads(history_path.read_text(encoding="utf-8"))
-            kept, dropped, legacy = [], 0, 0
+            kept, dropped, legacy, stale = [], 0, 0, 0
             for entry in entries:
+                # 測定方法のバージョンが違う履歴は絶対値もノイズ量も別物（v1=スライス1点、
+                # v2=全文）。旧履歴を best 判定に混ぜると測定方法の取り比べになるため除外する
+                if entry.get("metric_version") != _VAL_METRIC_VERSION:
+                    stale += 1
+                    continue
                 entry_hash = entry.get("val_hash")
                 if entry_hash is None:
                     # ハッシュ導入以前の履歴。検証セットが変わったか判定できないため
@@ -871,6 +1057,13 @@ def run():
                 else:
                     dropped += 1
             _eval_history.extend(kept)
+            if stale > 0:
+                logger.warning(
+                    f"検証損失の測定方法が変わったため、旧測定（metric_version の違う履歴）{stale} 件を"
+                    f"早期停止判定から除外しました（現行 v{_VAL_METRIC_VERSION}。"
+                    "学習を継続する場合は models/eval_history.json を消すか、"
+                    "新測定での評価が十分溜まるまで早期停止が発火しません）"
+                )
             if dropped > 0:
                 logger.warning(
                     f"val.list が変更されているため、別検証セット上の損失である履歴 {dropped} 件を早期停止判定から除外しました"
@@ -898,6 +1091,44 @@ def run():
         }
         logger.info(
             f"EMA を有効化しました (decay={hps.train.ema_decay})。評価保存時に _ema.safetensors も併記します"
+        )
+
+    # early_stopping_action="reduce_lr" の削減状態を履歴から復元する。LambdaLR は毎エポック
+    # base_lrs から LR を組み立てるため、再開時に過去の削減を再適用しないと黙って元の LR カードルへ
+    # 戻る。削減回数は eval_history.json の lr_reductions に記録済み。判定状態は rank 0 のみが
+    # 履歴を持つので、他ランクへ broadcast で揃える（LR はランク間で必ず同一でなければならない）
+    global _lr_reduce_count, _lr_reduced_step
+    _lr_reduce_count = 0
+    _lr_reduced_step = None
+    if rank == 0:
+        prior = max((int(e.get("lr_reductions", 0)) for e in _eval_history), default=0)
+        reduced_step = None
+        if prior > 0:
+            before = [
+                e["step"]
+                for e in _eval_history
+                if int(e.get("lr_reductions", 0)) == prior - 1
+            ]
+            reduced_step = max(before, default=None)
+        lr_state = [prior, reduced_step]
+    else:
+        lr_state = [None, None]
+    if n_gpus > 1:
+        dist.broadcast_object_list(lr_state, src=0)
+    _lr_reduce_count, _lr_reduced_step = lr_state
+    if _lr_reduce_count > 0:
+        restore_factor = hps.train.early_stopping_reduce_lr_factor**_lr_reduce_count
+        # base_lrs・現在の lr の両方へ factor^prior を掛ける。スケジューラ構築が
+        # optimizer 状態の削減済み lr を「削減前のカードル」で上書きしているため、
+        # ここで両方揃えないと最初の scheduler.step() まで削減が効かない
+        # （_reduce_lr の docstring 参照。torch 2.14 で挙動を実測確認済み）
+        _reduce_lr(
+            [scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd],
+            restore_factor,
+        )
+        logger.info(
+            f"eval_history から過去の学習率削減 {_lr_reduce_count} 回分"
+            f"（LR ×{restore_factor:.4g}）を復元しました"
         )
 
     # 学習中に例外で抜けてもプロセスグループと進捗バーを確実に閉じる
@@ -997,11 +1228,7 @@ def run():
                     )
                     if _ema_state is not None:
                         _save_ema_safetensors(
-                            net_g,
-                            epoch,
-                            final_safetensors.replace(
-                                ".safetensors", "_ema.safetensors"
-                            ),
+                            net_g, epoch, _ema_sibling(final_safetensors)
                         )
                     # 最終保存でも best 記録を最新化してから、keep_safetensors 上限で
                     # 古い eval 資産を整理する（best の step は必ず残す）
@@ -1047,8 +1274,10 @@ def train_and_evaluate(
 
     global global_step, _nan_skip_count
 
-    # 早期停止の判定結果（rank 0 が評価ステップで設定し、他ランクへブロードキャストで同期する）
+    # 早期停止の判定結果（rank 0 が評価ステップで設定し、他ランクへブロードキャストで同期する）。
+    # lr_reduce_requested も同じ経路で同期する（学習率は全ランクで必ず一致させる）
     early_stop_requested = False
+    lr_reduce_requested = False
 
     net_g.train()
     net_d.train()
@@ -1078,13 +1307,17 @@ def train_and_evaluate(
             batch_idx + 1 == len(train_loader)  # エポック末尾の端数も必ず更新する
         )
         if batch_idx % accumulation_steps == 0:
-            # 累積ウィンドウの先頭で勾配をリセット（ウィンドウ内の backward が合計される）
-            optim_g.zero_grad()
-            optim_d.zero_grad()
+            # 累積ウィンドウの先頭で勾配をリセット（ウィンドウ内の backward が合計される）。
+            # set_to_none=False は必須: DDP を gradient_as_bucket_view=True でラップしているため、
+            # 勾配テンソルを None にして作り直すとバケットビューの対応が壊れる
+            # （torch 側も毎イテレーションでビューが破棄され節約効果が消えると明記）。
+            # ゼロ埋めならバケット実体そのものをゼロ化するのでビューは有効なまま
+            optim_g.zero_grad(set_to_none=False)
+            optim_d.zero_grad(set_to_none=False)
             if optim_dur_disc is not None:
-                optim_dur_disc.zero_grad()
+                optim_dur_disc.zero_grad(set_to_none=False)
             if optim_wd is not None:
-                optim_wd.zero_grad()
+                optim_wd.zero_grad(set_to_none=False)
         with ExitStack() as stack:
             if not is_opt_step:
                 stack.enter_context(net_g.no_sync())
@@ -1236,12 +1469,12 @@ def train_and_evaluate(
             if is_opt_step and disc_ok:
                 optim_d.step()
             if not disc_ok:
-                # ゴミ勾配を次の累積ウィンドウへ引きずらない
-                optim_d.zero_grad()
+                # ゴミ勾配を次の累積ウィンドウへ引きずらない（set_to_none=False は上と同じ理由）
+                optim_d.zero_grad(set_to_none=False)
                 if optim_dur_disc is not None:
-                    optim_dur_disc.zero_grad()
+                    optim_dur_disc.zero_grad(set_to_none=False)
                 if optim_wd is not None:
-                    optim_wd.zero_grad()
+                    optim_wd.zero_grad(set_to_none=False)
 
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
@@ -1299,7 +1532,7 @@ def train_and_evaluate(
                 optim_g.step()
                 _ema_update(net_g, hps.train.ema_decay)
             if not gen_ok:
-                optim_g.zero_grad()
+                optim_g.zero_grad(set_to_none=False)
 
             # 非有限損失（NaN/inf）ガード。判定は全ランク同期済みなので、
             # スキップも停止も全ランクで同時に起きる（ハングしない）
@@ -1411,36 +1644,66 @@ def train_and_evaluate(
                 ):
                     if not hps.speedup:
                         evaluate(hps, net_g, eval_loader, writer_eval)
-                        val_metrics = validate_loss(hps, net_g, eval_loader, writer)
+                        val_metrics = validate_loss(hps, net_g, eval_loader, writer, wl)
                         if val_metrics:
                             _eval_history.append(
                                 {
                                     "step": global_step,
                                     "epoch": epoch,
                                     "val": val_metrics,
+                                    # 測定方法のバージョン（v2=全文復号）。旧バージョンの履歴は
+                                    # 読み込み時に早期停止判定から除外される
+                                    "metric_version": _VAL_METRIC_VERSION,
                                     # 検証セットの識別子。val.list を変更したら旧履歴の
                                     # 損失は比較不能になるので読み込み時に除外する
                                     "val_hash": _val_hash,
+                                    # 現在の学習率（reduce_lr の効果を目視確認するため）と
+                                    # 時点の削減回数。再開時の LR 削減復元はここから行う（run() 側）
+                                    "lr": optim_g.param_groups[0]["lr"],
+                                    "lr_reductions": _lr_reduce_count,
                                 }
                             )
                             _save_eval_history(hps)
                             if hps.train.early_stopping_enabled:
+                                # since_step: reduce_lr 済みならその削減以降の評価だけで判定する
+                                # （削減後に再改善した学習を、削減前の古い横ばいで即停止させない）
                                 stop, reason = _early_stop_check(
-                                    _eval_history, hps, initial_step
+                                    _eval_history,
+                                    hps,
+                                    initial_step,
+                                    since_step=_lr_reduced_step,
                                 )
                                 if stop:
-                                    early_stop_requested = True
-                                    best = _best_eval_entry(
-                                        _eval_history, hps, initial_step
-                                    )
-                                    logger.info(
-                                        f"Early stopping condition met at step {global_step}: {reason}"
-                                        + (
-                                            ""
-                                            if best is None
-                                            else _best_summary(hps, best[0], best[1])
+                                    if (
+                                        hps.train.early_stopping_action == "reduce_lr"
+                                        and _lr_reduce_count
+                                        < hps.train.early_stopping_reduce_lr_times
+                                    ):
+                                        # まだ停止せず学習率を半減して続行。実際の削減は
+                                        # broadcast 後に全ランクへ適用する（LR はランク間同期が必須）。
+                                        # 削減評価の履歴エントリには削減「前」の回数が残る
+                                        lr_reduce_requested = True
+                                        logger.info(
+                                            f"停止条件に到達したが early_stopping_action=reduce_lr のため"
+                                            f"学習率を ×{hps.train.early_stopping_reduce_lr_factor} に削減して続行します"
+                                            f"（{_lr_reduce_count + 1}/{hps.train.early_stopping_reduce_lr_times} 回目、"
+                                            f"step {global_step}: {reason}）"
                                         )
-                                    )
+                                    else:
+                                        early_stop_requested = True
+                                        best = _best_eval_entry(
+                                            _eval_history, hps, initial_step
+                                        )
+                                        logger.info(
+                                            f"Early stopping condition met at step {global_step}: {reason}"
+                                            + (
+                                                ""
+                                                if best is None
+                                                else _best_summary(
+                                                    hps, best[0], best[1]
+                                                )
+                                            )
+                                        )
                     utils.checkpoints.save_checkpoint(
                         net_g,
                         optim_g,
@@ -1488,11 +1751,7 @@ def train_and_evaluate(
                     )
                     if _ema_state is not None:
                         _save_ema_safetensors(
-                            net_g,
-                            epoch,
-                            saved_safetensors.replace(
-                                ".safetensors", "_ema.safetensors"
-                            ),
+                            net_g, epoch, _ema_sibling(saved_safetensors)
                         )
                     # 監視指標上の best を毎回更新して記録する。停止を待たずとも、どの
                     # .safetensors を推論に使うべきかが常に参照できる（手動中断でも失われない）。
@@ -1507,8 +1766,8 @@ def train_and_evaluate(
                         best_step=None if best is None else best[0]["step"],
                     )
 
-            # 停止判定を全ランクで同期する。ブロードキャスト条件は評価ブロックの条件と
-            # 同一にしておく（global_step は全ランク同一値なので同じ反復で合流できる）。
+            # 停止・学習率削減の判定を全ランクで同期する。ブロードキャスト条件は評価ブロックの
+            # 条件と同一にしておく（global_step は全ランク同一値なので同じ反復で合流できる）。
             # nccl は全ランクが同じステップで集合通信を抜けなければハングするため
             if (
                 global_step % hps.train.eval_interval == 0
@@ -1518,9 +1777,14 @@ def train_and_evaluate(
                 and dist.is_initialized()
                 and dist.get_world_size() > 1
             ):
-                obj = [early_stop_requested]
+                obj = [early_stop_requested, lr_reduce_requested]
                 dist.broadcast_object_list(obj, src=0)
-                early_stop_requested = obj[0]
+                early_stop_requested, lr_reduce_requested = obj[0], obj[1]
+            if lr_reduce_requested:
+                # 判定は rank 0 だけが行うが、削減自体は全ランクで同一に適用する
+                # （単一プロセスでは broadcast を経ずに rank 0 のフラグがそのまま届く）
+                _apply_lr_reduction(hps, schedulers)
+                lr_reduce_requested = False
             if early_stop_requested:
                 # global_step を増やす前に抜ける（評価ステップで保存済みのチェックポイントと一致させる）
                 break
@@ -1607,23 +1871,32 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     generator.train()
 
 
-def validate_loss(hps, net_g, eval_loader, writer):
-    """検証データ（val.list）で非敵対損失（mel/dur/kl）を計算し TensorBoard の val/* に書き込む。
+def validate_loss(hps, net_g, eval_loader, writer, wl=None):
+    """検証データ（val.list）で非敵対損失（mel/dur/kl + 必要なら lm）を**全文**で計算し TensorBoard の val/* に書き込む。
 
-    早期停止の監視指標。学習ステップと同じ forward（MAS アライメント + ランダムスライス）を
-    使うが、評価間で値を比較できるようシードを固定し MAS ノイズを 0 にする。
+    早期停止の監視指標。学習ステップと同じ forward（MAS アライメント）を使うが、評価間で値を
+    比較できるようシードを固定し MAS ノイズを 0 にする。mel・kl・lm は復号音声の全文で測る
+    （学習のような segment_size スライス1点にすると、測定音が「検証件数×0.37秒」分しかなく、
+    評価ノイズが収束幅より大きくなって早期停止がコイントスになる。実測で検証4件・1σ≒0.19）。
+    検証セットの件数自体は前処理の --val_ratio（既定5%）で決まる。
     敵対損失（fm/gen/wd 系）は判別器の状態に依存して単調でなくなるため監視に使わない。
+    lm（WavLM feature matching 損失）は敵対的ではない「実音声と生成音声の WavLM 特徴の距離」で、
+    知覚的な近さを mel のフレーム対応とは別軸から測る指標になる（wl を渡したときだけ計算）。
     DDP ラッパを介さず module を直接呼ぶ（rank 0 だけの forward で broadcast_buffers による
     集合通信が発生すると他ランクが待っておらずハングするため）。
+
+    測定方法は eval_history.json の metric_version で識別する（v1=スライス1点、v2=全文。
+    絶対値もノイズ量も別物なので、旧履歴と混ぜると best 判定が壊れる。run() の読み込みで除外）。
 
     Args:
         hps: ハイパーパラメータ
         net_g: 生成器（DDP ラップ可）
         eval_loader: val.list のデータローダ（batch_size=1）
         writer: TensorBoard writer
+        wl: WavLMLoss（None で lm 計算をスキップ。use_wavlm_discriminator: false の設定相当）
 
     Returns:
-        dict: 平均検証損失 {"mel":..,"dur":..,"kl":..,"total":..}。val.list が空なら {}
+        dict: 平均検証損失 {"mel":..,"dur":..,"kl":..,"total":..(,"lm":..)}。val.list が空なら {}
     """
     module = getattr(net_g, "module", net_g)
     if eval_loader is None or len(eval_loader) == 0:
@@ -1635,6 +1908,8 @@ def validate_loss(hps, net_g, eval_loader, writer):
     saved_mas_noise = getattr(module, "current_mas_noise_scale", None)
 
     totals = {"mel": 0.0, "dur": 0.0, "kl": 0.0}
+    if wl is not None:
+        totals["lm"] = 0.0
     n_batches = 0
     module.eval()
     with torch.no_grad():
@@ -1659,6 +1934,9 @@ def validate_loss(hps, net_g, eval_loader, writer):
         ) in eval_loader:
             x, x_lengths = x.cuda(), x_lengths.cuda()
             spec, spec_lengths = spec.cuda(), spec_lengths.cuda()
+            y = (
+                y.cuda()
+            )  # lm 計算で正解音声のスライスが必要（mel/dur/kl は spec 側だけ使う）
             speakers = speakers.cuda()
             tone = tone.cuda()
             language = language.cuda()
@@ -1693,11 +1971,17 @@ def validate_loss(hps, net_g, eval_loader, writer):
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
             )
-            y_mel = commons.slice_segments(
-                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
-            )
+            # 検証は全文で測る（v2）。学習は segment_size（既定 0.37秒）のランダムスライスだが、
+            # 検証もスライス1点にすると測定される音声が「検証件数×0.37秒」分しかなく、
+            # 評価ノイズが収束幅より大きくなることを実測で確認した（検証4件・9000step のランで
+            # 評価間 1σ≒0.19 あり、best(22.6078) と停止時(22.6240) の差 0.016 を区別できない）。
+            # 全文復号は推論時の挙動そのものでもあり、スライス損失より合成品質との対応が良い。
+            # forward は z_slice（スライス）しか復号しないので、全文の後標本 z を復号し直す。
+            # no_grad・batch_size=1 なので長文でも VRAM は問題にならない。
+            # ※ forward が返す y_hat / ids_slice（スライス側）は使わない
+            y_hat_full = module.dec(z, g=g)
             y_hat_mel = mel_spectrogram_torch(
-                y_hat.squeeze(1).float(),
+                y_hat_full.squeeze(1).float(),
                 hps.data.filter_length,
                 hps.data.n_mel_channels,
                 hps.data.sampling_rate,
@@ -1706,11 +1990,28 @@ def validate_loss(hps, net_g, eval_loader, writer):
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
             )
-            totals["mel"] += F.l1_loss(y_mel, y_hat_mel).item() * hps.train.c_mel
+            # z のフレーム数は spec のそれと一致するので通常は同形だが、短い側へ揃えておく
+            # （mel_spectrogram_torch は reflect パディング込みのフレーム数、正解側は ceil 枠）
+            n_mel_frames = min(mel.size(2), y_hat_mel.size(2))
+            totals["mel"] += (
+                F.l1_loss(
+                    y_hat_mel[:, :, :n_mel_frames], mel[:, :, :n_mel_frames]
+                ).item()
+                * hps.train.c_mel
+            )
             totals["kl"] += (
                 kl_loss(z_p, logs_q, m_p, logs_p, z_mask).item() * hps.train.c_kl
             )
             totals["dur"] += torch.sum(l_length.float()).item()
+            if wl is not None:
+                # lm も全文で測る（kl・dur は forward が全文で返す値なので元から全文基準）。
+                # wl.forward は層ごとに |er - eg| を取るため、実音声と生成音声のフレーム数が
+                # 1つでもずれるとブロードキャストに失敗する。生成音声は末尾 hop 未満の端数分
+                # 長くなることがあるので、両者を短い側のサンプル数へ揃えて WavLM へ入れる
+                n_wav = min(y.size(2), y_hat_full.size(2))
+                er = wl.encode(y[:, :, :n_wav].squeeze(1), requires_grad=False)
+                eg = wl.encode(y_hat_full[:, :, :n_wav].squeeze(1), requires_grad=False)
+                totals["lm"] += wl(er, eg).item()
             n_batches += 1
     module.train()
 
@@ -1721,10 +2022,13 @@ def validate_loss(hps, net_g, eval_loader, writer):
         module.current_mas_noise_scale = saved_mas_noise
 
     avg = {k: v / n_batches for k, v in totals.items()}
-    # total は mel + dur + kl の単なる合計。mel は c_mel（既定45）倍で桁が大きく、
-    # dur は音素数で正規化済みの MSE（batch_size=1 の評価では1発話あたり値）なので、
-    # total は実質 mel 支配になる。dur 変化だけを追いたい場合は monitor: "dur" を使うこと
-    avg["total"] = sum(avg.values())
+    # total は mel + dur + kl の合計（lm は含めない）。lm を total に入れると、lm 計算が
+    # 有効な実行と無効な実行（use_wavlm_discriminator: false 等）で total の意味が変わり、
+    # eval_history をまたいだ早期停止判定が壊れるため、lm は単独で監視する（monitor: "lm"）。
+    # mel は c_mel（既定45）倍で桁が大きく、dur は音素数で正規化済みの MSE（batch_size=1 の
+    # 評価では1発話あたり値）なので、total は実質 mel 支配になる。dur 変化だけを追いたい場合は
+    # monitor: "dur" を使うこと
+    avg["total"] = avg["mel"] + avg["dur"] + avg["kl"]
     utils.summarize(
         writer=writer,
         global_step=global_step,
@@ -1756,9 +2060,14 @@ def _best_eval_entry(
     判定窓は _early_stop_check と揃える（min_steps 超の評価のみ）。窓を揃えないと
     「停止理由が指す best」と「残す best」が食い違うため。min_steps 未達で窓が空に
     なる間は全履歴から選ぶ（best 自体は早期停止の有無に関係なく有益なので出す）。
+
+    best 選定は early_stopping_best_smooth（既定5）の窓内中央値で行う。検証損失は
+    評価ノイズで数%揺れるため、単発の最小値だと「偶発的に低く出た評価」を best に
+    選ぶくじ引きになる。中央値スムージングで近傍ごと安定して低い step を選び、
+    同スコアのときは生値・step 昇順（早い方）で決める。1 で従来動作（単発最小値）
     """
     key = hps.train.early_stopping_monitor
-    if key not in ("mel", "dur", "kl", "total"):
+    if key not in ("mel", "dur", "kl", "lm", "total"):
         key = "mel"
     judged = history
     min_steps = hps.train.early_stopping_min_steps
@@ -1770,7 +2079,21 @@ def _best_eval_entry(
     scored = [entry for entry in judged if key in entry.get("val", {})]
     if not scored:
         return None
-    return min(scored, key=lambda entry: entry["val"][key]), key
+    window = max(1, hps.train.early_stopping_best_smooth)
+    if window == 1:
+        return min(scored, key=lambda entry: entry["val"][key]), key
+    vals = [entry["val"][key] for entry in scored]
+    half = window // 2
+
+    def smoothed(i: int) -> float:
+        # 自身を中心に窓を取り、端はクリップ（2点の中央値は平均になり対称に効く）
+        return statistics.median(vals[max(0, i - half) : min(len(vals), i + half + 1)])
+
+    best_i = min(
+        range(len(scored)),
+        key=lambda i: (smoothed(i), vals[i], scored[i]["step"]),
+    )
+    return scored[best_i], key
 
 
 def _best_summary(hps, entry: dict, key: str) -> str:
@@ -1778,11 +2101,24 @@ def _best_summary(hps, entry: dict, key: str) -> str:
     step = entry["step"]
     epoch = entry.get("epoch")
     name = f"{hps.model_name}_e{epoch}_s{step}.safetensors"
+    if hps.train.best_use_ema:
+        # 推論用の1点は EMA 重みのコピー（best_use_ema 既定 true）。検証損失を実測して
+        # best step を選んだ通常重み側は _ema 併記ファイルとして残ることを添える
+        use = f"best.safetensors（EMA 重み。実体 {_ema_sibling(name)}）"
+    else:
+        use = name
     return (
         f" / 監視指標 {key} の best は step {step}（{entry['val'][key]:.4f}）。"
         f"残った .pth は停止step（再開用）なので、推論には "
-        f"{os.path.join(str(hps.out_dir), name)} を使用してください"
+        f"{os.path.join(str(hps.out_dir), use)} を使用してください"
     )
+
+
+def _ema_sibling(name: str) -> str:
+    """通常重みの .safetensors 名から対応する EMA 重み名を作る（sibling ファイル）"""
+    suffix = ".safetensors"
+    stem = name[: -len(suffix)] if name.endswith(suffix) else name
+    return f"{stem}_ema{suffix}"
 
 
 def _save_best_checkpoint(hps, entry: dict, key: str) -> None:
@@ -1790,19 +2126,29 @@ def _save_best_checkpoint(hps, entry: dict, key: str) -> None:
 
     keep_ckpts=1 では停止stepの .pth だけが残り、best の .pth は clean_checkpoints で
     削除済み。.pth は再開用（optim 状態つき）で巻き戻せるものではないため、推論に使う
-    べき資産は別にあることを機械可読に残す。eval ごとの .safetensors は model_assets/
-    に全残存するので best は失われていない（3点セットの config.json / style_vectors.npy
-    は 1 ラン内で共通なので、どの .safetensors とも組める）。
+    べき資産は別にあることを機械可読に残す。eval ごとの .safetensors は keep_safetensors
+    の上限で間引かれるので、best の実体は best.safetensors として1点固定名で保持する
+    （3点セットの config.json / style_vectors.npy は 1 ラン内で共通なので、コピーは本体だけでよい）
     """
     step = entry["step"]
     epoch = entry.get("epoch")
+    name = f"{hps.model_name}_e{epoch}_s{step}.safetensors"
+    ema_name = _ema_sibling(name)
+    # best.safetensors にコピーする実体を選ぶ。best step の選定は通常重みで検証損失を
+    # 実測して行うが、同一 step 比較では EMA 重みの方が合成品質に優位だった（test_h 実測:
+    # 8/8 の候補で UTMOS 優位・平均 +0.27、mel 相関 7/8 優位）。ユーザーが普通に読むのは
+    # best.safetensors なので、書き出す1点は EMA 側を既定にする。EMA 実体が無い step
+    # （ema_decay=0・EMA 導入前の古い資産）は通常重みへフォールバックする
+    use_ema = hps.train.best_use_ema and (Path(hps.out_dir) / ema_name).is_file()
     payload = {
         "model_name": hps.model_name,
         "step": step,
         "epoch": epoch,
         "monitor": key,
         "value": entry["val"][key],
-        "safetensors": f"{hps.model_name}_e{epoch}_s{step}.safetensors",
+        "safetensors": name,
+        "safetensors_ema": ema_name,
+        "weights": "ema" if use_ema else "normal",  # best.safetensors に入った実体
         "assets_dir": str(hps.out_dir),
         "note": "早期停止の監視指標で最良の評価。models/ の .pth は停止stepのもので再開用",
     }
@@ -1818,27 +2164,54 @@ def _save_best_checkpoint(hps, entry: dict, key: str) -> None:
     # keep_safetensors で古い eval 資産が削除されるようになり、best が古い step だと
     # 実体が消える事態がありうるため、推論に使うべき1点は名前で固定参照できる実体を持つ。
     # 3点セットの config.json / style_vectors.npy は 1 ラン内で共通なのでコピーは本体だけでよい。
-    # 同じ best のたびに ~120MB コピーし直さないよう、best step が変わるときだけコピーする
+    # コピー元は best_use_ema が既定（EMA 重み）。同じ best のたびに ~120MB コピーし直さないよう、
+    # best step が変わるときだけコピーする
     global _best_copied_step
-    src = Path(hps.out_dir) / payload["safetensors"]
+    src = Path(hps.out_dir) / (ema_name if use_ema else name)
     dst = Path(hps.out_dir) / "best.safetensors"
     if _best_copied_step != step and src.is_file():
+        # tmp → os.replace のアトミックコピー。直接 shutil.copyfile だと書き込み途中で
+        # 失敗（disk 満杯等）したとき best.safetensors が破損した状態で残る。tmp 経由なら
+        # 失敗しても既存 best は前回の正常なまま。_best_copied_step を更新しないので
+        # 次の評価ステップで自動再試行される（失敗を warning で済ませ学習は止めないが、
+        # 推論直結の資産なので error レベルで目立たせる）
+        tmp = dst.with_name(f"best.safetensors.tmp{os.getpid()}")
         try:
-            shutil.copyfile(src, dst)
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
             _best_copied_step = step
-            logger.info(f"best を best.safetensors へコピーしました (step {step})")
+            logger.info(
+                f"best を best.safetensors へコピーしました"
+                f" (step {step}, {payload['weights']} 重み)"
+            )
         except OSError as e:
-            logger.warning(f"best.safetensors へのコピーに失敗しました: {e}")
+            logger.error(
+                f"best.safetensors へのコピーに失敗しました（既存 best が古いうえ次の評価まで"
+                f"再試行されません disk を点検してください。実体の best 自体は "
+                f"{src.name} に残っています）: {e}"
+            )
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
-def _early_stop_check(history: list[dict], hps, initial_step: int) -> tuple[bool, str]:
+def _early_stop_check(
+    history: list[dict], hps, initial_step: int, since_step: int | None = None
+) -> tuple[bool, str]:
     """検証損失履歴から早期停止すべきかを判定する。
 
     - 判定開始点: early_stopping_min_steps が今回の学習開始点（再開時は再開step）から
       経過した後の評価のみを判定に使う（それ以前の履歴は best・patience・プラトー窓に
       一切数えない）。新規学習の早すぎる停止と、履歴を引き継いだ再開直後の即停止を防ぐ。
       0 の場合は全履歴を対象にする
-    - patience: best 更新（min_delta 以上の改善）が無い評価が early_stopping_patience 回続いたら停止
+    - since_step: ここ（early_stopping_action="reduce_lr" の直近削減 step 等）を
+      超えた評価だけで判定する。None で無効
+    - patience: best 更新（実効 min_delta 以上の改善）が無い評価が early_stopping_patience
+      回続いたら停止。実効 min_delta = max(early_stopping_min_delta,
+      best × early_stopping_min_delta_rel)。検証損失は評価ノイズで ±数% 揺れるため、
+      絶対値 0.001 だけだとノイズの偶発更新で patience が永遠に発火せず epochs 上限まで
+      走り続ける（best に対する割合で見るのが ReduceLROnPlateau 等の慣習）
     - プラトー: 直近 early_stopping_plateau_window 評価の最小二乗回帰傾きの絶対値が
       |平均値| × early_stopping_plateau_slope_eps 以下なら停止（0 で無効）
 
@@ -1849,20 +2222,31 @@ def _early_stop_check(history: list[dict], hps, initial_step: int) -> tuple[bool
     if min_steps > 0:
         threshold = initial_step + min_steps
         history = [entry for entry in history if entry["step"] > threshold]
+    if since_step is not None:
+        history = [entry for entry in history if entry["step"] > since_step]
 
     key = hps.train.early_stopping_monitor
-    if key not in ("mel", "dur", "kl", "total"):
+    if key not in ("mel", "dur", "kl", "lm", "total"):
         logger.warning(f"early_stopping_monitor='{key}' は不明です。'mel' で判定します")
         key = "mel"
     vals = [entry["val"][key] for entry in history if key in entry.get("val", {})]
     if len(vals) < 2:
         return False, ""
 
-    # patience 判定（min_delta 付きの best 追跡）
+    # patience 判定（実効 min_delta 付きの best 追跡）
     best = float("inf")
     counter = 0
     for v in vals:
-        if v < best - hps.train.early_stopping_min_delta:
+        if not math.isfinite(best):
+            # 初回は必ず best 登録（inf に相対閾値を引くと nan になり誤って counter が増える）
+            best = v
+            counter = 0
+            continue
+        effective_delta = max(
+            hps.train.early_stopping_min_delta,
+            best * hps.train.early_stopping_min_delta_rel,
+        )
+        if v < best - effective_delta:
             best = v
             counter = 0
         else:
@@ -1870,7 +2254,7 @@ def _early_stop_check(history: list[dict], hps, initial_step: int) -> tuple[bool
     if counter >= hps.train.early_stopping_patience:
         return (
             True,
-            f"patience 超過: best({key}={best:.4f}) 更新なしが {counter} 評価続いています",
+            f"patience 超過: best({key}={best:.4f}) 更新なし（実効閾値 {max(hps.train.early_stopping_min_delta, best * hps.train.early_stopping_min_delta_rel):.4f} 未満の改善）が {counter} 評価続いています",
         )
 
     # プラトー判定（窓内最小二乗回帰の相対傾き）
