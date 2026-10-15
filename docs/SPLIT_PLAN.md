@@ -1,7 +1,15 @@
 # Style-Bert-VITS2 分割計画
 
-本リポジトリを「学習コア」を中心に分割・簡素化するための方針ドキュメント。
-これまでの方針検討で**確定した決定事項**と、残す作業・未決事項をまとめる。
+> **ステータス: 実施完了（歴史記録）**。この文書は分割実施当時（2026-10）に確定した方針の記録で、以降の更新はしない。
+> 現状の運用は [README](../README.md) / [GUIDE.md](GUIDE.md)、その後の設計・既定値の進化の経緯は [DECISIONS.md](DECISIONS.md) を参照。
+>
+> **計画と最終実装の主な差分**:
+> - 学習の呼び出し口: 計画では `train_ms_jp_extra.py` に統一 → 最終的には `train_model.py`（本体は `train/pipeline.py`）に再編。`train/`・`preprocess/` パッケージへのレイアウト再編も実施（フラットレイアウト）
+> - 設定管理: 計画では `configs/config_jp_extra.json` へ一本化 → 最終的には `configs/` 自体を削除し、`style_bert_vits2/models/hyper_parameters.py`（Pydantic 既定値）を単一ソースとして `preprocess_all.py --set` で上書きする方式にした
+> - 前処理チェーン: 計画 §5 の text→bert_gen→style_gen 3ステップ → 最終的には initialize / extract_raw / check_dataset を加えた Step 1〜6（`preprocess_all.py` が一括実行）
+> - 分割後の追加実装（早期停止・best 自動選定・EMA・検証損失の全文評価・勾配累積・NaN ガードなど）は計画にない後続の作業で、経緯は [DECISIONS.md](DECISIONS.md) §9–§10 に記録
+
+これまでの方針検討で**確定した決定事項**と、残す作業・未決事項をまとめる（以下は当時の記録のまま）。
 
 ---
 

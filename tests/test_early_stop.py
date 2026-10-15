@@ -10,6 +10,11 @@ keep_ckpts=1 では停止stepの .pth だけが残り best の .pth は削除さ
 カバーする追加契約:
 - best 選定の中央値スムージング（early_stopping_best_smooth。ノイズの偶発的低値をくじ引きで選ばない）
 - patience の実効閾値 max(min_delta, best × min_delta_rel)（評価ノイズで発火し続けるのを防ぐ）
+- 悪化方向の停止（窓内回帰傾きが +閾値 超。|傾き|≦閾値 のプラトーだけでは、明らかに
+  悪化する run を早期停止できず epochs 上限まで走る空白地帯があった）
+- early_stopping_min_steps=-1（自動）の解決: max(1000, 5×1エポックのstep数)。固定 3000 は
+  小規模データセットで39エポック以上に相当し、判定開始前に過学習が進行した実測の修正
+- 既定 patience 10→5（実測6 run で判定対象評価が5〜8回しかなく、旧既定は一度も発火不能だった）
 - since_step（reduce_lr 後は削減以降の評価だけで判定）
 - _reduce_lr の LambdaLR base_lrs スケール（削減がエポック境界を越えて持続）
 - best.safetensors のアトミックコピー（tmp→os.replace・同一 best の再コピー防止）
@@ -28,6 +33,7 @@ from train.pipeline import (
     _best_summary,
     _early_stop_check,
     _reduce_lr,
+    _resolve_early_stopping_min_steps,
     _save_best_checkpoint,
 )
 
@@ -187,7 +193,9 @@ class TestBestMatchesStopReason:
     """この修正の動機そのもの: 停止理由が指す best と残す best が食い違わないこと"""
 
     def test_プラトーで停止したランのbestは停止stepより手前(self):
-        hps = make_hps()  # 実運用と同じ既定値
+        # プラトー判定を隔離するため patience を旧既定値で明示する（新既定 patience=5 は
+        # この履歴で先に発火する。新既定の発火自体は TestDefaultPatience で契約化する）
+        hps = make_hps(early_stopping_min_steps=3000, early_stopping_patience=10)
         history = make_history()
         stop, reason = _early_stop_check(history, hps, initial_step=0)
         assert stop is True
@@ -415,9 +423,9 @@ class TestSinceStep:
     """reduce_lr 後は削減 step 以降の評価だけで patience/プラトーを判定する"""
 
     def test_削減前の横ばいは判定に数えない(self):
-        # MEL 履歴は既定設定で step 11000 でプラトー停止するが、
-        # 削減を step 8000 で受けた想定（since_step=8000）なら窓は 9000 以降の 3 評価。
-        # ここは改善継続中なので停止しない
+        # MEL 履歴は新既定（patience=5・min_steps 未解決=全窓）なら step 6000 で patience
+        # 停止するが、削減を step 8000 で受けた想定（since_step=8000）なら窓は 9000 以降の
+        # 3 評価。ここは改善継続中なので停止しない
         hps = make_hps()  # 実運用と同じ既定値（この履歴では since_step なしで停止する）
         history = make_history()
         stop, _ = _early_stop_check(history, hps, initial_step=0)
@@ -432,6 +440,82 @@ class TestSinceStep:
         stop_none = _early_stop_check(history, hps, initial_step=0)
         stop_wide = _early_stop_check(history, hps, initial_step=0, since_step=None)
         assert stop_none == stop_wide
+
+
+class TestWorseningStop:
+    """悪化が明らかなら停止する（窓内回帰傾きが +閾値 を超過）。
+
+    旧実装は |傾き|≦閾値（プラトー）のみ停止で、ノイズ帯を超えて悪化する run は
+    プラトー判定では止まらなかった。best は保存済みなので悪化中の続行に益はなく、
+    評価回数の少ない小規模データセットでは patience も発火しにくく epochs 上限まで
+    走りうる（korisu/nashu で kl・total が単調上昇した実測の空白地帯の修正）。
+    """
+
+    # 横ばいから悪化に転じた履歴（窓5の傾き +0.3/評価、閾値は |平均|×0.002 ≒ +0.022）
+    WORSENING = [10.0, 10.0, 10.0, 10.0, 10.0, 10.3, 10.6, 10.9, 11.2, 11.5]
+
+    def test_明らかな悪化で停止する(self):
+        # patience を無効化して傾き判定だけを隔離する（この履歴では patience も成立するが、
+        # 悪化停止が単独で機能することを示すため）
+        hps = make_hps(early_stopping_min_steps=0, early_stopping_patience=99)
+        stop, reason = _early_stop_check(
+            make_history(self.WORSENING), hps, initial_step=0
+        )
+        assert stop is True
+        assert "悪化" in reason
+
+    def test_ノイズ帯内の悪化はプラトーとして停止する(self):
+        # MEL 履歴の窓5傾きは +0.022（閾値 ±0.035 内）→ 悪化ではなくプラトー扱い（従来動作）
+        hps = make_hps(early_stopping_min_steps=3000, early_stopping_patience=10)
+        stop, reason = _early_stop_check(make_history(), hps, initial_step=0)
+        assert stop is True
+        assert "プラトー" in reason
+
+    def test_改善継続中は悪化もプラトーも発火しない(self):
+        # 窓5の傾き -0.5/評価（閾値 -0.02 を大きく下回る改善中）なら停止しない
+        improving = [12.0, 11.5, 11.0, 10.5, 10.0, 9.5, 9.0]
+        hps = make_hps(early_stopping_min_steps=0, early_stopping_patience=99)
+        stop, _ = _early_stop_check(make_history(improving), hps, initial_step=0)
+        assert stop is False
+
+
+class TestDefaultPatience:
+    """新既定 patience=5 は実測長（判定対象評価5〜8回）の run で到達可能であること。
+
+    旧既定 10 は実測6 run すべてで counter 最大 6〜7 に届かず発火不能だった
+    （全 run がプラトー停止）。patience は悪化停止と並ぶ安全網なので、短い run でも
+    発火できる値に下げる
+    """
+
+    def test_既定patienceはMEL履歴で発火する(self):
+        hps = make_hps(early_stopping_min_steps=3000)  # patience は新既定 5 のまま
+        stop, reason = _early_stop_check(make_history(), hps, initial_step=0)
+        assert stop is True
+        assert "patience" in reason
+
+
+class TestAdaptiveMinSteps:
+    """early_stopping_min_steps=-1（自動）は max(1000, 5×1エポックのstep数) に解決される"""
+
+    def test_autoは下限1000(self):
+        # korisu 相当: 152文 / batch_size 2 = 76 step/エポック → 5×76=380 < 1000 → 下限
+        hps = make_hps(early_stopping_min_steps=-1)
+        assert _resolve_early_stopping_min_steps(hps, 76) == 1000
+        # 解決値は hps へ書き戻される（以降の _early_stop_check / _best_eval_entry が参照）
+        assert hps.train.early_stopping_min_steps == 1000
+
+    def test_autoは5エポック相当(self):
+        # hikaru 相当: 686文 / batch_size 2 = 343 step/エポック → 5×343=1715
+        # （旧固定 3000 なら約9エポック。5エポックで判定開始を早める）
+        hps = make_hps(early_stopping_min_steps=-1)
+        assert _resolve_early_stopping_min_steps(hps, 343) == 1715
+        assert hps.train.early_stopping_min_steps == 1715
+
+    def test_明示指定はそのまま返す(self):
+        for value in (0, 3000):
+            hps = make_hps(early_stopping_min_steps=value)
+            assert _resolve_early_stopping_min_steps(hps, 343) == value
+            assert hps.train.early_stopping_min_steps == value
 
 
 class TestReduceLrMechanism:

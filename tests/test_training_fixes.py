@@ -424,6 +424,7 @@ def test_validate_train_config_extended():
         "epochs": 0,
         "learning_rate": 0.0,
         "early_stopping_patience": 0,
+        "early_stopping_min_steps": -2,  # -1（自動）/ 0 / 正のstep数でなければならない
         "early_stopping_min_delta_rel": -0.1,
         "early_stopping_plateau_window": 2,  # 0 か 3 以上でなければならない
         "early_stopping_action": "halt",

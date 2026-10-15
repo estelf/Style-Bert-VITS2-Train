@@ -149,8 +149,8 @@ exclude = ["**/__pycache__", "Data", "model_assets", "pretrained", "tests/model_
 # 実バグではなく型情報の限界が原因だと全件で確認できたため
 # （error のままだとノイズに埋もれて新規の実エラーが見えなくなる）。
 # 締める際は各コメントの該当箇所から順に error へ戻す。
-reportAttributeAccessIssue = "warning" # 残10件。DDP 展開の hasattr(model,"module") 展開が型詰められない（checkpoints.py / safetensors.py の 5件）、floss=0 初期化に対する .mean()/.backward()（losses.py:116、pipeline.py:836,855）、torch.hub.load の戻り値（select_best.py:105）
-reportCallIssue = "warning" # 残2件。torch スタブ起因。models_jp_extra.py:616 の layer.remove_weight_norm() 等が Tensor と解釈される
+reportAttributeAccessIssue = "warning" # 残10件（pyright 1.1.414 実測）。DDP 展開の hasattr(model,"module") 展開が型詰められない（checkpoints.py / safetensors.py の load/save 系5件）、floss=0 初期化に対する .mean()/.backward()（losses.py の WavLMLoss.forward、pipeline.py の loss_disc_all/loss_dur_disc_all の backward）、torch.hub.load の戻り値（select_best.py の load_utmos）、torch.utils.data.distributed の属性解決（data_utils.py の DistributedBucketSampler クラス定義）
+reportCallIssue = "warning" # 残2件。torch スタブ起因。commons.py の initialize_weights（m.weight.data.normal_()）と models_jp_extra.py の Generator.remove_weight_norm（layer.remove_weight_norm()）が Tensor と解釈される
 
 [[tool.pyright.executionEnvironments]]
 root = "train"

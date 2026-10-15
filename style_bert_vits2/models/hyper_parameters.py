@@ -38,10 +38,10 @@ class HyperParametersTrain(BaseModel):
     freeze_decoder: bool = False
     keep_ckpts: int = 1  # 0 で全チェックポイント保持
     keep_safetensors: int = (
-        12  # model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し。
+        6  # model_assets/ の .safetensors を step 単位で保持する個数。0 で全残し。
         # eval_interval=1000 ごとに通常+EMA の2枚（計約500MB）が増えるため、0 のまま
-        # 長期学習だと disk を圧迫する（40000step 走れば約20GB）。best.safetensors と
-        # best step の実体は間引き対象外なので、推論・select_best 用の1点は消えない
+        # 長期学習だと disk を圧迫する。best.safetensors と best step の実体は間引き
+        # 対象外なので、推論・select_best 用の1点は消えない（値の根拠は docs/DECISIONS.md §9.4）
     )
     spec_cache: bool = True  # スペクトルキャッシュ（.spec.pt）を使うか
     num_workers: int = (
@@ -78,24 +78,26 @@ class HyperParametersTrain(BaseModel):
         "mel"  # 監視する検証損失: mel | dur | kl | lm | total（lm は WavLM 特徴一致。total は mel+dur+kl の和で lm は含まない）
     )
     early_stopping_min_steps: int = (
-        3000  # 今回の学習開始点（再開時は再開step）からの経過がこれを超える評価のみ判定に使う。0 で全履歴対象
+        -1  # 今回の学習開始点（再開時は再開step）からの経過がこれを超える評価のみ判定に使う。
+        # -1（既定・自動）は学習開始時にデータセット規模から max(1000, 5×1エポックのstep数) へ
+        # 解決される（train.pipeline._resolve_early_stopping_min_steps）。0 で全履歴対象。
+        # 自動解決に変えた経緯は docs/DECISIONS.md §9.4
     )
     early_stopping_patience: int = (
-        10  # best 更新（min_delta 以上の改善）が無い評価が続いたら停止
+        5  # best 更新（min_delta 以上の改善）が無い評価が続いたら停止。
+        # 短めの run でも発火できる値（発火不能だった旧既定からの経緯は docs/DECISIONS.md §9.4）
     )
     early_stopping_min_delta: float = 0.001  # これ未満の改善は best 更新とみなさない
     early_stopping_min_delta_rel: float = (
         0.01  # 絶対値ではなく best に対する割合で見る閾値（1%）。実際の判定は max(min_delta, best×この値)。
-        # 検証損失は評価ノイズで揺れる（検証47件の実測で1評価の揺らぎ σ=0.70%、検証4件だと3.4%）。
-        # 0.5% はノイズ帯（0.7σ）なので約4件に1件の割合で運だけの best 更新が起き、patience が
-        # ほぼ永遠に発火しなかった。1%（1.4σ）で実質的な改善だけ best 更新とみなし、patience を
-        # 機能させる（品質が下がり始める前に早めに止まる方向に効く）。0 で従来動作
+        # 検証損失は評価ノイズで揺れるため、閾値はノイズ帯より広く取る（既定 1% ≒ 1.4σ。
+        # 狭いとノイズの偶発更新で patience が発火しない。σ 実測と旧既定の経緯は docs/DECISIONS.md §9.3）。
+        # 0 で従来動作
     )
     early_stopping_best_smooth: int = (
         5  # best チェックポイント選定を窓内中央値で行う幅（1 で従来動作の単発最小値）。
-        # 1評価のノイズ（σ 0.70%）で偶発的に低く出た step を best に選ぶ「くじ引き」を防ぎ、
-        # 近傍ごと安定して低い step を選ぶ。窓3でも運の要素が残ったため実測ノイズに合わせて5。
-        # 0 以下は 1 扱い
+        # 評価ノイズで偶発的に低く出た step を best に選ぶ「くじ引き」を防ぎ、
+        # 近傍ごと安定して低い step を選ぶ。0 以下は 1 扱い
     )
     early_stopping_action: str = (
         "stop"  # 停止条件到達時の動作: "stop" で学習停止、"reduce_lr" で学習率を半減して続行し、
@@ -111,7 +113,9 @@ class HyperParametersTrain(BaseModel):
         5  # プラトー検出の窓（評価回数）。0 で無効。patience より先に平坦化で止めたい時に使う
     )
     early_stopping_plateau_slope_eps: float = (
-        0.002  # 窓内回帰傾きの絶対値が |平均値|×この値 以下ならプラトーとみなす
+        0.002  # 窓内回帰傾きの絶対値が |平均値|×この値 以下ならプラトーとみなす。
+        # 傾きが +閾値 を超える（ノイズ帯を超えて悪化）場合も停止する。悪化が明らかな
+        # 学習を続けても best は保存済みなので得られない（docs/DECISIONS.md §9.4）
     )
 
 

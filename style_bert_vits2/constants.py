@@ -21,7 +21,7 @@ ASSETS_ROOT = Path(os.environ.get("SBV2_ASSETS_ROOT", str(BASE_DIR / "model_asse
 # 学習時の分散環境変数のデフォルト（環境変数が未設定の場合に pipeline が使用。上書きしたい場合は環境変数を直接指定）
 TRAIN_ENV_DEFAULTS = {
     "MASTER_ADDR": "::1",  # IPv6ループバック（WSL2 mirrored mode でも確実にbind/connectできるため localhost でなくリテラル指定。IPv6 自体が使えない環境では train/pipeline.py が 127.0.0.1 へフォールバックする）
-    "MASTER_PORT": "10086",
+    "MASTER_PORT": "10086",  # 参考上の既定値。実際には train/pipeline.py が未設定時に空きポートへ差し替える（同時実行する2本目の衝突回避。torchrun 経由ならランチャー側の指定を尊重）
     "WORLD_SIZE": "1",
     "RANK": "0",
     "LOCAL_RANK": "0",
