@@ -62,7 +62,6 @@ module-name = "style_bert_vits2"
 module-root = ""
 # ソース配布物に含める追加ファイル（コアライブラリ本体以外のリポジトリ資産。LICENSE 等はデフォルトで含まれる）
 source-include = [
-    "configs/**",
     "dict_data/default.csv",
     "docs/**",
     "tests/**",

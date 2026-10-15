@@ -11,17 +11,17 @@ from pathlib import Path
 
 import soundfile as sf
 
+from style_bert_vits2.constants import MAX_SPEC_FRAMES, MIN_SPEC_FRAMES
 from style_bert_vits2.logging import logger
 
 # soundfile (libsndfile) でメタデータを読める拡張子
 SUPPORTED_SUFFIXES = {".flac", ".wav", ".ogg", ".mp3"}
 
-# DistributedBucketSampler のバケット境界（train/pipeline.py）と一致させる尺の範囲。
-# この外の音声は学習時に黙って破棄されるため、前処理段階で警告として通知する（エラーにはしない。
-#   既定値なら 32 フレーム ≒ 0.37秒未満、1000 フレーム ≒ 11.6秒超 で除外対象。
-#   変更時は train/pipeline.py の boundaries 側も必ず同じ値に揃えること）
-MIN_SPEC_FRAMES = 32
-MAX_SPEC_FRAMES = 1000
+# DistributedBucketSampler のバケット境界は style_bert_vits2/constants.py の
+# MIN_SPEC_FRAMES / MAX_SPEC_FRAMES（BUCKET_BOUNDARIES）が単一のソース。この範囲外の音声は
+# 学習時に黙って破棄されるため、前処理段階で警告として通知する（エラーにはしない。
+#   既定値なら 32 フレーム ≒ 0.37秒以下、1000 フレーム ≒ 11.6秒超 で除外対象。
+#   下限はサンプラーと同じく排他的（ちょうど32フレームも除外される））
 
 
 def check_dataset(
@@ -80,15 +80,16 @@ def check_dataset(
             )
         if channels != 1:
             problems.append(f"{rel}: モノラルではありません ({channels} channels)")
-        # 尺の範囲検証（ DistributedBucketSampler のバケット境界外の音声は学習時に黙って破棄されるため、
-        #   前処理段階で参考情報として警告だけ出す。エラーにはしない ）
+        # 尺の範囲検証（DistributedBucketSampler のバケット境界外の音声は学習時に黙って破棄されるため、
+        #   前処理段階で参考情報として警告だけ出す。エラーにはしない。
+        #   下限はサンプラーの _bisect（境界 < 長数の strict 比較）と揃え、ちょうど下限フレーム数も除外扱いにする）
         duration = frames / file_sr
-        if not min_seconds <= duration <= max_seconds:
+        if not min_seconds < duration <= max_seconds:
             out_of_range.append(f"{rel} ({duration:.2f}s)")
 
     if out_of_range:
         logger.warning(
-            f"長さがバケット範囲 [{min_seconds:.2f}s, {max_seconds:.2f}s] 外の音声が {len(out_of_range)} 件あります（学習時に除外されます）: {out_of_range[:10]}"
+            f"長さがバケット範囲 ({min_seconds:.2f}s, {max_seconds:.2f}s] 外の音声が {len(out_of_range)} 件あります（学習時に除外されます）: {out_of_range[:10]}"
         )
 
     if total == 0:
