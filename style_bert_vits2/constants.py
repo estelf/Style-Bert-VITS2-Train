@@ -77,4 +77,4 @@ DEFAULT_ASSIST_TEXT_WEIGHT = 1.0
 # Gradio のテーマ
 ## Built-in theme: "default", "base", "monochrome", "soft", "glass"
 ## See https://huggingface.co/spaces/gradio/theme-gallery for more themes
-GRADIO_THEME = "NoCrypt/miku"
+GRADIO_THEME = "glass"
