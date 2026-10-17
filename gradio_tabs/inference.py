@@ -287,9 +287,6 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
             message = wrong_tone_message + "\n" + message
         return message, (sr, audio), kata_tone_json_str
 
-    def get_model_files(model_name: str):
-        return [str(f) for f in model_holder.model_files_dict[model_name]]
-
     model_names = model_holder.model_names
     if len(model_names) == 0:
         logger.error(
@@ -301,7 +298,9 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
             )
         return app
     initial_id = 0
-    initial_pth_files = get_model_files(model_names[initial_id])
+    initial_files = model_holder.model_files_dict[model_names[initial_id]]
+    initial_pth_files = [str(f) for f in initial_files]
+    initial_model_file = str(model_holder.default_model_file(initial_files))
 
     with gr.Blocks() as app:
         gr.Markdown(initial_md)
@@ -320,7 +319,7 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
                         model_path = gr.Dropdown(
                             label="モデルファイル",
                             choices=initial_pth_files,
-                            value=initial_pth_files[0],
+                            value=initial_model_file,
                         )
                     refresh_button = gr.Button("更新", scale=1, visible=True)
                     load_button = gr.Button("ロード", scale=1, variant="primary")
