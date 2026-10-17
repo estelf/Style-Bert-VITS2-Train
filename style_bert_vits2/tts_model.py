@@ -509,6 +509,18 @@ class TTSModelHolder:
                 )
             )
 
+    @staticmethod
+    def default_model_file(model_files: list[Path]) -> Path:
+        """UI のモデルファイルドロップダウンの既定選択を返す。
+
+        best.safetensors（select_best.py / 監視 best が勧める推論用1点）があればそれを優先し、
+        無ければ refresh で更新日時が新しい順にソート済みの先頭を使う。
+        """
+        for f in model_files:
+            if f.name == "best.safetensors":
+                return f
+        return model_files[0]
+
     def get_model(self, model_name: str, model_path_str: str) -> TTSModel:
         """
         指定された音声合成モデルのインスタンスを取得する。
@@ -582,8 +594,10 @@ class TTSModelHolder:
     def update_model_files_for_gradio(self, model_name: str):
         import gradio as gr
 
-        model_files = [str(f) for f in self.model_files_dict[model_name]]
-        return gr.Dropdown(choices=model_files, value=model_files[0])
+        files = self.model_files_dict[model_name]
+        model_files = [str(f) for f in files]
+        default = str(self.default_model_file(files))
+        return gr.Dropdown(choices=model_files, value=default)
 
     def update_model_names_for_gradio(
         self,
@@ -592,11 +606,11 @@ class TTSModelHolder:
 
         self.refresh()
         initial_model_name = self.model_names[0]
-        initial_model_files = [
-            str(f) for f in self.model_files_dict[initial_model_name]
-        ]
+        initial_files = self.model_files_dict[initial_model_name]
+        initial_model_files = [str(f) for f in initial_files]
+        initial_model_file = str(self.default_model_file(initial_files))
         return (
             gr.Dropdown(choices=self.model_names, value=initial_model_name),
-            gr.Dropdown(choices=initial_model_files, value=initial_model_files[0]),
+            gr.Dropdown(choices=initial_model_files, value=initial_model_file),
             gr.Button(interactive=False),  # For tts_button
         )
