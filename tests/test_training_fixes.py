@@ -246,7 +246,7 @@ def test_pyannote_file_format_accepted():
     """_pyannote_file の出力が pyannote-audio 4.x の validate_file を通ること。
 
     旧形式 {"array", "sampling_rate"} は pyannote 4 で ValueError になる
-    （select_best --spk-sim が 別データセットでクラッシュした）。モデルダウンロード不要で
+    （select_best --spk-sim が別データセットでクラッシュした）。モデルダウンロード不要で
     フォーマット互換のみ検証する
     """
     pytest.importorskip("pyannote.audio")
