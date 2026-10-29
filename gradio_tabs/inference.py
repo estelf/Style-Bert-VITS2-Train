@@ -30,6 +30,9 @@ pyopenjtalk.initialize_worker()
 # データセットの BERT 特徴量は前処理で `preprocess.bert_gen` が既に抽出済みなので、試聴時に別途ロードするだけでよい
 # BERT モデルも合成モデル（net_g）も遅延ロードで、初回の音声合成時に TTSModel.infer() 内（extract_bert_feature →
 # bert_models.load_model / net_g の get_net_g）でロードされる。「ロード」ボタン時点では TTSModel の構築のみ行う
+# なお BERT の**ファイル取得**は TTSModelHolder 構築時（app.py が launch 前に通る）に済む。
+# 未取得のまま「合成」を押して 1.3GB のダウンロードが始まる、という詰まり方を避けるため
+# （style_bert_vits2.pretrained は完備なら通信しないので、通常は存在チェックだけで終わる）
 
 initial_text = "こんにちは、初めまして。あなたの名前はなんていうの？"
 

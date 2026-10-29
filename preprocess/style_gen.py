@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 from numpy.typing import NDArray
 from tqdm import tqdm
 
@@ -21,18 +20,13 @@ class NaNValueError(ValueError):
 
 @lru_cache(maxsize=1)
 def _get_inference():
-    """pyannote モデルは重量級でダウンロードも走るため、実際にスタイル生成が必要になるまで遅延ロードする（--help だけで落ちない）"""
-    from pyannote.audio import Inference, Model
+    """pyannote モデルは重量級でダウンロードも走るため、実際にスタイル生成が必要になるまで遅延ロードする（--help だけで落ちない）
 
-    model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM")
-    if model is None:
-        raise RuntimeError(
-            "pyannote/wespeaker-voxceleb-resnet34-LM を読み込めませんでした。"
-            "Hugging Face 側でモデルの利用条件に同意し、トークンを設定しているか確認してください。"
-        )
-    inference = Inference(model, window="whole")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return inference.to(device)
+    取得先（`pretrained/pyannote/...`）と pyannote のロード手順は style_bert_vits2.speaker に一本化した
+    """
+    from style_bert_vits2.speaker import load_speaker_inference
+
+    return load_speaker_inference()
 
 
 # 推論時にインポートするために短いが関数を書く

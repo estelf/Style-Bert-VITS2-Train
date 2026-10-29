@@ -24,6 +24,7 @@ from transformers import (
 
 from style_bert_vits2.constants import DEFAULT_BERT_MODEL_PATH
 from style_bert_vits2.logging import logger
+from style_bert_vits2.pretrained import ensure_pretrained
 
 if TYPE_CHECKING:
     import torch
@@ -51,7 +52,7 @@ def load_model(
     cache_dir と revision は pretrain_model_name_or_path がリポジトリ名の場合のみ有効。
 
     Args:
-        pretrained_model_name_or_path (Optional[str]): ロードする学習済みモデルの名前またはパス。指定しない場合はデフォルトのパスが利用される (デフォルト: None)
+        pretrained_model_name_or_path (Optional[str]): ロードする学習済みモデルの名前またはパス。指定しない場合はデフォルトのパスが利用され、未取得なら style_bert_vits2.pretrained が Hugging Face から取得する (デフォルト: None)
         device_map (Optional[str]): accelerate を使用して高速にデバイスにロードするためのデバイスマップ。
             指定しない場合は通常のモデルロード処理になる (デフォルト: None)
             ref: https://huggingface.co/docs/accelerate/usage_guides/big_modeling
@@ -68,11 +69,12 @@ def load_model(
     if __loaded_model is not None:
         return __loaded_model
 
-    # pretrained_model_name_or_path が指定されていない場合はデフォルトのパスを利用
+    # pretrained_model_name_or_path が指定されていない場合はデフォルトのパスを利用。
+    # デフォルトパスを使うときだけ自動取得を試みる（パスを明示した利用者はダウンロードしない）。
+    # 完備チェックはディレクトリの存在ではなく manifest のファイル単位（旧実装は git 同梱の
+    # config.json だけで pass し、重み欠落を from_pretrained の分かりにくい OSError で露出させていた）
     if pretrained_model_name_or_path is None:
-        assert (
-            DEFAULT_BERT_MODEL_PATH.exists()
-        ), "The default JP BERT model does not exist on the file system. Please specify the path to the pre-trained model."
+        ensure_pretrained(("bert",))
         pretrained_model_name_or_path = str(DEFAULT_BERT_MODEL_PATH)
 
     # BERT モデルをロードし、格納して返す
@@ -107,7 +109,7 @@ def load_tokenizer(
     cache_dir と revision は pretrain_model_name_or_path がリポジトリ名の場合のみ有効。
 
     Args:
-        pretrained_model_name_or_path (Optional[str]): ロードする学習済みモデルの名前またはパス。指定しない場合はデフォルトのパスが利用される (デフォルト: None)
+        pretrained_model_name_or_path (Optional[str]): ロードする学習済みモデルの名前またはパス。指定しない場合はデフォルトのパスが利用され、未取得なら style_bert_vits2.pretrained が Hugging Face から取得する (デフォルト: None)
         cache_dir (Optional[str]): モデルのキャッシュディレクトリ。指定しない場合はデフォルトのキャッシュディレクトリが利用される (デフォルト: None)
         revision (str): モデルの Hugging Face 上の Git リビジョン。指定しない場合は最新の main ブランチの内容が利用される (デフォルト: None)
 
@@ -122,10 +124,9 @@ def load_tokenizer(
         return __loaded_tokenizer
 
     # pretrained_model_name_or_path が指定されていない場合はデフォルトのパスを利用
+    # （モデルと同じく、デフォルトパスを使うときだけ自動取得を試みる）
     if pretrained_model_name_or_path is None:
-        assert (
-            DEFAULT_BERT_MODEL_PATH.exists()
-        ), "The default JP BERT tokenizer does not exist on the file system. Please specify the path to the pre-trained model."
+        ensure_pretrained(("bert",))
         pretrained_model_name_or_path = str(DEFAULT_BERT_MODEL_PATH)
 
     # BERT トークナイザーをロードし、格納して返す

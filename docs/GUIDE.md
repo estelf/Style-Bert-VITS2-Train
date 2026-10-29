@@ -16,7 +16,18 @@ uv sync
 uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl/cu128
 ```
 
-なお、日本語BERT・JP-Extra事前学習モデル・SLM のダウンロード（`pretrained/` への取得）は前処理時に自動で行われます。手動でまとめて取得しておきたい場合のみ `uv run -m train.initialize` を実行してください（環境構築用のコマンドであり、モデルごとの運用手順には出てきません）。
+なお、日本語BERT・JP-Extra事前学習モデル・SLM・話者埋め込み（pyannote wespeaker）のダウンロード（`pretrained/` への取得）は、前処理・学習・試聴GUIの起動時に自動で行われます（揃っていれば通信しません。取得先は `style_bert_vits2/pretrained.py` の manifest が単一ソースで、`pretrained/` 配下は軽い config 類も含めて全てダウンロード成果物です）。手動でまとめて取得しておきたい場合のみ次のコマンドを実行してください（環境構築用のコマンドであり、モデルごとの運用手順には出てきません）。
+
+```bash
+uv run -m style_bert_vits2.pretrained --dry-run          # 取得予定と総量を確認
+uv run -m style_bert_vits2.pretrained                    # 全部取得（約2GB）
+uv run -m style_bert_vits2.pretrained --only bert        # 推論に必要な BERT だけ
+uv run -m style_bert_vits2.pretrained --check            # 完備状況の確認（欠ければ exit 1）
+```
+
+オフライン・CI などで暗黙のダウンロードを止めたいときは `SBV2_SKIP_PRETRAINED_DOWNLOAD=1` を設定します（未取得のモデルが必要になると、何が無さるかを示して停止する）。
+
+なお BERT は `model.safetensors` を使うため、git 同梱をやめた旧ファイル（`pretrained/bert/deberta-v2-large-japanese-char-wwm/pytorch_model.bin` と `tokenizer.json`）が手元に残っていても使われません。約1.4GB 浮くので削除して構いません（自動削除はしません）。
 
 ## 1. どんなデータセットを受け入れるか（契約）
 

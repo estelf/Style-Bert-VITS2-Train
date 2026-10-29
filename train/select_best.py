@@ -8,7 +8,7 @@
       既定は発話長がずれると下がる仕様なので、長さ差を無視して形状だけ見たいときは --len-norm
     - utmos:    UTMOS22 による MOS 予測（torch.hub 経由。--utmos 指定時のみ、初回はネットワーク必要）
     - spk_sim:  合成音声と正解音声の話者埋め込み（pyannote wespeaker）の cos 類似度。
-                --spk-sim 指定時のみ。Hugging Face トークンが必要
+                --spk-sim 指定時のみ。未取得なら pretrained/ へダウンロードが発生する（トークン不要）
 
 候補が多い長期学習では --stride N で間引ける（最新 step は必ず評価対象。評価時間は候補数に比例）
 
@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument(
         "--spk-sim",
         action="store_true",
-        help="話者類似度（pyannote wespeaker 埋め込みの cos 類似度）も計算する（Hugging Face トークンとモデル同意が必要）",
+        help="話者類似度（pyannote wespeaker 埋め込みの cos 類似度）も計算する（未取得なら pretrained/ に約98MBダウンロード。トークン不要）",
     )
     parser.add_argument(
         "--stride",
@@ -176,13 +176,13 @@ def utmos_score(model, audio_int16: np.ndarray, sr: int, device: str) -> float:
 
 
 def load_speaker_inference():
-    """話者埋め込みモデル（pyannote wespeaker）をロード（失敗時は None。評価は続行）"""
+    """話者埋め込みモデル（pretrained/ 配下の pyannote wespeaker）をロード（失敗時は None。評価は続行）"""
     try:
-        # preprocess.style_gen と同じモデル・同じ前処理経路を再利用する（遅延ロード）
-        from preprocess.style_gen import _get_inference
+        # preprocess.style_gen と同じモデル・同じ経路を再利用する（遅延ロード・未取得なら取得）
+        from style_bert_vits2.speaker import load_speaker_inference as _load
 
-        return _get_inference()
-    except Exception as e:  # 未同意・オフライン等。評価自体は続けたいので広く捕まえる
+        return _load()
+    except Exception as e:  # オフライン・未取得等。評価自体は続けたいので広く捕まえる
         logger.warning(
             f"話者埋め込みモデルの読み込みに失敗したため spk_sim なしで評価します: {e}"
         )

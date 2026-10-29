@@ -29,4 +29,4 @@
 
 - 学習の途中状態・ログ: `Data/<モデル名>/models/`（G_/D_/DUR_/WD_*.pth、tfevents。学習曲線は `uv run tensorboard --logdir Data/<モデル名>/models`）。
 - 推論・共有用3点セット: `model_assets/<モデル名>/`（config.json + `<モデル名>_e<epoch>_s<step>.safetensors` + `style_vectors.npy`）。共有時は3点をセットで渡すこと。名前が統一されていない場合は同じセットの style_vectors.npy/config.json が必要。
-- `pretrained/` の事前学習モデル（bert/jp_extra/slm）は前処理時に自動取得される。一括手動取得は `uv run -m train.initialize`。
+- `pretrained/` の事前学習モデル（bert/slm/jp_extra/speaker）は前処理・学習・推論アプリの入口で自動取得される（`style_bert_vits2.pretrained.ensure_pretrained()` が manifest 駆動で取得。完備なら通信しない）。一括手動取得・状況確認は `uv run -m style_bert_vits2.pretrained`（`--dry-run` / `--check` あり）。`pretrained/` 配下は軽い config 類も含め git に含まない。

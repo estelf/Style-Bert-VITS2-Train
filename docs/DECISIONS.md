@@ -124,7 +124,7 @@
 ## 11. 推論・成果物・スタイル
 
 - **推論 dtype 既定 float16**: フル半精度推論で VRAM 節約。bfloat16 は仮数が8ビットしかなく、duration の ceil() 量子化と組み合わせて精度劣化が大きいため推論では非対応。**学習は float32 のみ**（bf16/fp16 学習経路は廃止済み）。
-- **BERT・合成モデルの遅延ロード**: 試聴GUIの起動を軽く保つため、`TTSModel` 構築時点では net_g をロードせず、初回合成時にロードする。BERT も同様に初回合成の `extract_bert_feature()` から `bert_models.load_model()` で遅延ロードされる（学習済みデータセットの BERT 特徴量は前処理で `preprocess.bert_gen` が抽出済みなので、試聴時に別途ロードするだけでよい）。
+- **BERT・合成モデルの遅延ロード**: 試聴GUIの起動を軽く保つため、`TTSModel` 構築時点では net_g をロードせず、初回合成時にロードする。BERT も同様に初回合成の `extract_bert_feature()` から `bert_models.load_model()` で遅延ロードされる（学習済みデータセットの BERT 特徴量は前処理で `preprocess.bert_gen` が抽出済みなので、試聴時に別途ロードするだけでよい）。**ファイルの取得**は別問題で、`TTSModelHolder` 構築時（＝app.py が launch 前に通る地点）に済ませる（§14）。
 - **スタイル既定 Neutral 1本**: Neutral だけでも十分高い精度が出るため。サブディレクトリごとのスタイル生成は `--styles_by_dirs` 明示時のみ（フォルダ分けしていてもフラグが無ければ Neutral として扱われる）。スタイルベクトルの代表値は MAD（中央値絶対偏差）基準の反復トリム平均（外れ値の音声に引きずられないため。1.4826 は正規分布で MAD が標準偏差と一致する補正係数）。サブディレクトリが0〜1個ではスタイル分けの意味がないため Neutral 1本で作り直す。
 - **共有契約**: `model_assets/<モデル名>/` の3点セット（config.json + safetensors + style_vectors.npy）をセットで渡す。名前が統一されていない場合は style_vectors.npy と config.json も同じセットのものが必要。
 - **`best.safetensors` のコピーはアトミック**（tmp→os.replace）で、同一 best の再コピー（~120MB）は step 記録で抑止する。keep_safetensors の間引きでも best と best step の実体は消えない。
@@ -144,3 +144,16 @@
 
 - error にしているのは「当リポジトリで直せる型問題」だけ。残りは実バグでなく型情報の限界が原因と全件確認できたため warning にしている（error のままだとノイズに埋もれて新規の実エラーが見えなくなる）。締める際は pyproject.toml のコメントにある該当箇所から順に error へ戻す。件数・箇所は pyproject.toml の `[tool.pyright]` コメントが現行の実測と一致していること（pyright 更新で増減するため要確認）。
 - `train/` 配下だけを executionEnvironments で緩和しているのは、判別器・writer・optimizer が機能オフ時に None のまま受け渡され、損失変数がフラグガードの中で条件付き定義されるという学習ループの設計上の型ノイズが集中するため。
+
+## 14. 事前学習モデルの取得（2026-10-29）
+
+- **現状**: 取得は `style_bert_vits2/pretrained.py` の `ensure_pretrained()` 1本。対象はコード内 manifest `PRETRAINED_REPOS` の4リポジトリだけ（bert=deberta-v2-large-japanese-char-wwm / slm=wavlm-base-plus / jp_extra=Style-Bert-VITS2-2.0-base-JP-Extra / speaker=pyannote wespeaker）。`pretrained/` 配下は**軽い config 類も含めて全てダウンロード成果物**で git に含まない（取得元が単一ソース）。上流由来の `initialize.py` の `download_default_models()`（デフォルト TTS モデル）に続き、`train/initialize.py` と `pretrained/bert/bert_models.json` も廃止した。
+- **ライブラリ側に寄せた理由**: 取得は学習（SLM・JP-Extra）にも推論（BERT・話者埋め込み）にも必要な下準備なのに、旧実装はパイプライン側の `train/initialize.py` に住んでいた。そのため ①前処理を飛ばして `train_model.py` を単体実行すると SLM 欠落で落ちる ②`app.py` は BERT が無いと「ディレクトリは存在するが重みが無い」状態で `from_pretrained` の分かりにくい OSError に遭遇する、という2つの穴が残っていた。ライブラリ側に置けば消費側の入口で守れる。
+- **旧実装の穴（再発防止）**: 完備チェックが `DEFAULT_BERT_MODEL_PATH.exists()`（**ディレクトリ**の存在）だった。git 同梱の `config.json` だけで pass し、重み欠落が実行時まで表面化しなかった。現在はファイル単位（0 バイトも欠落とみなす）で、取得後も欠けが残れば `PretrainedModelMissing`。
+- **manifest をコード内に置いた理由**: JP-Extra 一本化で4件固定。JSON（旧 bert_models.json）は多言語対応の名残で、遅延ロード前提のデータ駆動に見見かけだけの自由度があった。dataclass にすれば型検査が効き、`hyper_parameters.py` の `slm.model` や pyannote の `AssetFileName.Model` との一致をテストで契約できる（ズレると「取得済みなのに読めない」が静かに起きる）。
+- **重みは safetensors 1本**: `ku-nlp/deberta-v2-large-japanese-char-wwm` は `pytorch_model.bin` と `model.safetensors` を**両方**持つ（usedStorage 2.6GB）。文字通り全スナップショットを取ると BERT だけ2倍になるので `allow_patterns` で safetensors に絞った。実測で `.bin` と `model.safetensors` の BERT 出力（hidden_states）は**ビット単位で一致**（3文の sha256 が完全一致、float32 指定時）。既存環境に残る `pytorch_model.bin`（1.3GB）と `tokenizer.json` は自動削除しない（transformers は safetensors を優先するので放置でも動く）。
+- **`tokenizer.json` は取らない**: HF 側に存在しない（旧 git 同梱ファイル）。`vocab.txt` だけで `BertJapaneseTokenizer` が構築でき、トークン列は `tokenizer.json` ありと完全一致することを実測。
+- **pyannote wespeaker を unified した理由**: 前処理 Step6 は話者埋め込みが必須なのに、ここだけ HF キャッシュ（`~/.cache/huggingface`）経由で「pretrained/ が揃えばオフラインで通る」契約の外側にあった。`Model.from_pretrained(ディレクトリ)` は `AssetFileName.Model`（=pytorch_model.bin）を直接読むのでローカル化できる。コード内に「Hugging Face の利用条件に同意しトークンを設定」という案内があったが、このリポジトリは gated でなく**無認証で取得できる**（実測 200 OK）。トークン必須は上流のセグメンテーションモデルの話で、`Model.from_pretrained` は失敗時に None を返さず例外を投げるため `if model is None` 分岐も死んでいた。追加は約25MB。
+- **自動取得のタイミング**: 前処理・学習は入口で全対象。推論アプリは `TTSModelHolder.__init__` 既定 `pretrained_targets=("bert",)`（app.py は launch 前にここを通る＝GUI 側を変えずに起動時取得）。初回合成のボタン押下で 1.3GB が走り出すのを避けるため、`load_model()` 内のチェックはフォールバックとして残す（`TTSModel` を直接使う select_best・テストは holder を通さない）。`load_model()/load_tokenizer()` にパスを明示したライブラリ利用者は一切ダウンロードしない。
+- **通信しない契約**: 完備なら manifest の存在チェックだけで return する。`hf_hub_download`/`snapshot_download` は revision を `main` のまま使うと**存在していても HEAD を叩く**ため、先に自前で弾く（旧実装は毎回 HEAD）。オフラインは `HF_HUB_OFFLINE=1`、暗黙の取得抑止は `SBV2_SKIP_PRETRAINED_DOWNLOAD=1`（未取得が必要になると例外＋案内）。
+- **`--dry-run` の落とし穴**: hf_hub の `is_cached`/`will_download` は `~/.cache/huggingface` も見るため、`local_dir` に無い 1.3GB が「取得不要」表示になり得る。`plan_download()` は local_dir の完備判定と掛け合わせて `exists/copy/download/update` に分類している。

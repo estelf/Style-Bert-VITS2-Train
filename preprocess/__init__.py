@@ -3,8 +3,9 @@
 トップレベルの呼び出し口は `preprocess_all.py`（一括実行CLI）で、本パッケージの
 `preprocess_all()` を呼ぶ。各段階はモデル名だけで一意に決まる冪等設計（順序や状態ファイルに依存しない）。
 BERT特徴・スタイル特徴の生成は重いので別プロセス（`uv run -m preprocess.bert_gen` 等）として実行する。
-環境構築（BERT・SLM・JP-Extra事前学習モデルの取得）は手順ではなく下準備なので、`preprocess_all()` が
-必要な分だけ自動でダウンロードする（手動で実行したい場合のみ `uv run -m train.initialize` を使う）。
+環境構築（BERT・SLM・JP-Extra 事前学習モデル・話者埋め込みの取得）は手順ではなく下準備なので、
+`preprocess_all()` が `style_bert_vits2.pretrained.ensure_pretrained()` 経由で必要な分だけ自動でダウンロードする
+（手動でまとめて取得したい場合のみ `uv run -m style_bert_vits2.pretrained` を使う）。
 """
 
 import json
@@ -13,6 +14,7 @@ from preprocess.check_dataset import check_dataset as check_wavs
 from preprocess.initialize import extract_raw, initialize
 from style_bert_vits2.constants import DATASET_ROOT
 from style_bert_vits2.logging import logger
+from style_bert_vits2.pretrained import ensure_pretrained
 from style_bert_vits2.utils.subprocess import run_script_with_log
 
 __all__ = [
@@ -167,16 +169,9 @@ def preprocess_all(
     """
     if model_name == "":
         raise ValueError("モデル名は空にできません")
-    # 環境構築（モデル取得）は前処理の下準備として自動で行う（既存ファイルがあればスキップされる冪等な処理）
-    from train.initialize import (
-        download_bert_models,
-        download_jp_extra_pretrained_models,
-        download_slm_model,
-    )
-
-    download_bert_models()
-    download_slm_model()
-    download_jp_extra_pretrained_models()
+    # 環境構築（モデル取得）は前処理の下準備として自動で行う（完備なら通信しない冪等な処理）。
+    # 対象は pretrained/ の全4種。Step1 の copytree が jp_extra を、Step5 が bert、Step6 が speaker を要する
+    ensure_pretrained()
     initialize(
         model_name=model_name,
         set_overrides=set_overrides,

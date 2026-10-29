@@ -10,7 +10,7 @@
 
 ```bash
 # 1. インストール（GPU環境では先に torch を入れてから uv sync でも可）
-uv sync                      # BERT・JP-Extra事前学習モデル・SLM は前処理時に自動で取得されます（手動一括取得は `uv run -m train.initialize`）
+uv sync                      # BERT・JP-Extra事前学習モデル・SLM・話者埋め込みは前処理/学習/試聴GUI起動時に自動で取得されます（手動一括取得は `uv run -m style_bert_vits2.pretrained`）
 
 # 2. Data/<モデル名>/ に esd.list + raw.zip を置く → 前処理 → 学習
 uv run preprocess_all.py -m <モデル名>   # 前処理（データセット検証〜特徴抽出）

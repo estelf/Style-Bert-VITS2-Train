@@ -28,7 +28,7 @@ dependencies = [
     # accelerate は直接 import しないが、transformers の from_pretrained(device_map=...)
     # （bert_models.load_model 経由の BERT ロード）が実行時に必須とするためコア依存のまま
     "accelerate",
-    "huggingface-hub",  # train/initialize.py の事前学習モデル取得（hf_hub_download）に必要
+    "huggingface-hub",  # style_bert_vits2/pretrained.py の事前学習モデル取得（snapshot_download）に必要
     # librosa は train/mel_processing.py の mel 変換行列のみのため、torchaudio への代替も
     # 検討の余地はあるが、フィルタバンクの数値が微妙に異なる（学習結果＝ゴールデン音声の
     # 契約が変わる）ため現状は維持。以下4つ（huggingface-hub/librosa/soundfile/tensorboard）は

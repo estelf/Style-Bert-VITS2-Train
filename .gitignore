@@ -8,18 +8,9 @@ dist/
 .DS_Store
 ._*
 
-/pretrained/bert/*/*.bin
-/pretrained/bert/*/*.h5
-/pretrained/bert/*/*.model
-/pretrained/bert/*/*.safetensors
-/pretrained/bert/*/*.msgpack
-/pretrained/bert/*/*.onnx
-
-
-/pretrained/jp_extra/*.safetensors
-/pretrained/jp_extra/*.pth
-
-/pretrained/slm/*/*.bin
+# 事前学習済みモデル（bert/slm/jp_extra/speaker）は全て style_bert_vits2.pretrained のダウンロード成果物。
+# git で管理しない（軽い config 類も含め、取得元は Hugging Face を単一ソースとする）
+/pretrained/
 
 *.zip
 *.csv

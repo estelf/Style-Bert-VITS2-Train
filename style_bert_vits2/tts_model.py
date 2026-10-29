@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,7 @@ from style_bert_vits2.constants import (
 )
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
+from style_bert_vits2.pretrained import ensure_pretrained
 from style_bert_vits2.voice import adjust_voice
 
 if TYPE_CHECKING:
@@ -182,31 +184,12 @@ class TTSModel:
 
         if self.style_vector_inference is None:
 
+            # 話者埋め込みモデルは pretrained/ 配下から読む（未取得ならここで初めて取得される）。
             # pyannote.audio は scikit-learn などの大量の重量級ライブラリに依存しているため、
             # TTSModel.infer() に reference_audio_path を指定し音声からスタイルベクトルを推論する場合のみ遅延 import する
-            try:
-                import pyannote.audio
-            except ImportError:
-                raise ImportError(
-                    "pyannote.audio is required to infer style vector from audio"
-                )
+            from style_bert_vits2.speaker import load_speaker_inference
 
-            # スタイルベクトルを取得するための推論モデルを初期化
-            import torch
-
-            speaker_model = pyannote.audio.Model.from_pretrained(
-                "pyannote/wespeaker-voxceleb-resnet34-LM"
-            )
-            if speaker_model is None:
-                raise RuntimeError(
-                    "pyannote/wespeaker-voxceleb-resnet34-LM を読み込めませんでした。"
-                    "Hugging Face 側でモデルの利用条件に同意し、トークンを設定しているか確認してください。"
-                )
-            self.style_vector_inference = pyannote.audio.Inference(
-                model=speaker_model,
-                window="whole",
-            )
-            self.style_vector_inference.to(torch.device(self.device))
+            self.style_vector_inference = load_speaker_inference(self.device)
 
         # 音声からスタイルベクトルを推論
         xvec = self.style_vector_inference(audio_path)
@@ -418,6 +401,8 @@ class TTSModelHolder:
         model_root_dir: Path,
         device: str,
         dtype: str = "float16",
+        *,
+        pretrained_targets: Sequence[str] | None = ("bert",),
     ) -> None:
         """
         Style-Bert-VITS2 の音声合成モデルを管理するクラスを初期化する。
@@ -439,6 +424,10 @@ class TTSModelHolder:
             model_root_dir (Path): 音声合成モデルが配置されているディレクトリのパス
             device (str): 音声合成時に利用するデバイス (cpu, cuda, mps など)
             dtype (str): 音声合成時に利用する重みの精度 ("float32" / "float16")
+            pretrained_targets (Sequence[str] | None): 初期化時に揃えておく事前学習モデル
+                （既定は ("bert",)。合成に必要な BERT を未取得のまま「合成」ボタンで
+                ダウンロードが始まり数分固まるのを防ぐ。()` で抑止、
+                SBV2_SKIP_PRETRAINED_DOWNLOAD=1 も効く）
         """
 
         self.root_dir: Path = model_root_dir
@@ -448,6 +437,11 @@ class TTSModelHolder:
         self.current_model: TTSModel | None = None
         self.model_names: list[str] = []
         self.models_info: list[TTSModelInfo] = []
+        # 推論に必要な事前学習モデルをここで確保する（完備なら通信ゼロ、欠けているときだけ取得）。
+        # app.py は launch 前にここを通るため、GUI 側コードを変更せずに起動時取得が成立する。
+        # TTSModel を直接使う経路のフォールバックは bert_models.load_model() 側にある
+        if pretrained_targets:
+            ensure_pretrained(pretrained_targets)
         self.refresh()
 
     def refresh(self) -> None:

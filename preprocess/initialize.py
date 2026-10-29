@@ -11,9 +11,10 @@ import zipfile
 
 from pydantic import BaseModel, TypeAdapter
 
-from style_bert_vits2.constants import BASE_DIR, DATASET_ROOT, VERSION
+from style_bert_vits2.constants import DATASET_ROOT, VERSION
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
+from style_bert_vits2.pretrained import PRETRAINED_REPOS
 
 _logger_handler = None
 
@@ -134,7 +135,9 @@ def initialize(
             既定では既存チェックポイント（学習途中の G_*.pth 等）を尊重し、config.json の更新だけ行う。
 
     Raises:
-        FileNotFoundError: pretrained/jp_extra が存在しない場合など
+        FileNotFoundError: 事前学習モデル pretrained/jp_extra が存在しない場合
+            （`preprocess_all()` 経由なら ensure_pretrained() が先に揃える。単体実行で未取得なら
+            `uv run -m style_bert_vits2.pretrained --only jp_extra` で先に取得する）
         ValueError: set_overrides のパス・値が不正、または変更禁止キーへの変更指定
     """
     global _logger_handler
@@ -194,7 +197,7 @@ def initialize(
                 src=model_path, dst=dataset_path / "models_backup", dirs_exist_ok=True
             )
             shutil.rmtree(model_path)
-        shutil.copytree(src=BASE_DIR / "pretrained/jp_extra", dst=model_path)
+        shutil.copytree(src=PRETRAINED_REPOS["jp_extra"].local_dir, dst=model_path)
 
     with open(dataset_path / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)

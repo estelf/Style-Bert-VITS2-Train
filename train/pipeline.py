@@ -43,6 +43,7 @@ from style_bert_vits2.models.models_jp_extra import (
     WavLMDiscriminator,
 )
 from style_bert_vits2.nlp.symbols import SYMBOLS
+from style_bert_vits2.pretrained import PRETRAINED_REPOS, ensure_pretrained
 from train import default_style
 from train.data_utils import (
     DistributedBucketSampler,
@@ -1019,6 +1020,11 @@ def run():
         slm_path = Path(slm_model)
         if not slm_path.is_absolute() and not slm_path.exists():
             slm_model = str(BASE_DIR / slm_model)
+        # それでも見つからない（＝既定パスが未取得）なら manifest 基準に揃えて取得する。
+        # config で別の既存パスを指定している場合はダウンロードしない
+        if not Path(slm_model).exists():
+            ensure_pretrained(("slm",))
+            slm_model = str(PRETRAINED_REPOS["slm"].local_dir)
         wl = WavLMLoss(
             slm_model,
             net_wd,

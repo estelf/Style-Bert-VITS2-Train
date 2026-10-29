@@ -18,6 +18,19 @@ DATASET_ROOT = Path(os.environ.get("SBV2_DATASET_ROOT", str(BASE_DIR / "Data")))
 ## 環境変数 SBV2_ASSETS_ROOT で差し替え可能（回帰テストは tests/model_assets を使い、ユーザーの実モデルを絶対に触らない）
 ASSETS_ROOT = Path(os.environ.get("SBV2_ASSETS_ROOT", str(BASE_DIR / "model_assets")))
 
+# 事前学習済みモデル（BERT・SLM・JP-Extra・話者埋め込み）の置き場所
+## ここへの取得は style_bert_vits2.pretrained.ensure_pretrained() が担う（git には含まれない、全てダウンロード成果物）
+## 環境変数 SBV2_PRETRAINED_ROOT で差し替え可能（テストは一時ディレクトリを使う）
+PRETRAINED_ROOT = Path(
+    os.environ.get("SBV2_PRETRAINED_ROOT", str(BASE_DIR / "pretrained"))
+)
+
+# 自動ダウンロードの抑止（CI・オフライン・ミラー環境用）
+## 有効な状態で未取得のモデルが必要になると PretrainedModelMissing で停止する（黙って通信しない）
+SKIP_PRETRAINED_DOWNLOAD = os.environ.get(
+    "SBV2_SKIP_PRETRAINED_DOWNLOAD", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
 # 学習時の分散環境変数のデフォルト（環境変数が未設定の場合に pipeline が使用。上書きしたい場合は環境変数を直接指定）
 TRAIN_ENV_DEFAULTS = {
     "MASTER_ADDR": "::1",  # IPv6ループバック（WSL2 mirrored mode でも確実にbind/connectできるため localhost でなくリテラル指定。IPv6 自体が使えない環境では train/pipeline.py が 127.0.0.1 へフォールバックする）
@@ -53,9 +66,10 @@ class Languages(StrEnum):
     JP = "JP"
 
 
-# 日本語 BERT モデルのデフォルトパス
+# 日本語 BERT モデルのデフォルトパス（style_bert_vits2.pretrained の "bert" エントリと一致させる。
+## tests/test_pretrained.py が一致を検証する）
 DEFAULT_BERT_MODEL_PATH = (
-    BASE_DIR / "pretrained" / "bert" / "deberta-v2-large-japanese-char-wwm"
+    PRETRAINED_ROOT / "bert" / "deberta-v2-large-japanese-char-wwm"
 )
 
 # デフォルトのユーザー辞書ディレクトリ
