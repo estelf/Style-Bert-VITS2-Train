@@ -2155,7 +2155,7 @@ def _save_best_checkpoint(hps, entry: dict, key: str) -> None:
     name = f"{hps.model_name}_e{epoch}_s{step}.safetensors"
     ema_name = _ema_sibling(name)
     # best.safetensors にコピーする実体を選ぶ。best step の選定は通常重みで検証損失を
-    # 実測して行うが、同一 step 比較では EMA 重みの方が合成品質に優位だった（実測run 実測:
+    # 実測して行うが、同一 step 比較では EMA 重みの方が合成品質に優位だった（実測run:
     # 8/8 の候補で UTMOS 優位・平均 +0.27、mel 相関 7/8 優位）。ユーザーが普通に読むのは
     # best.safetensors なので、書き出す1点は EMA 側を既定にする。EMA 実体が無い step
     # （ema_decay=0・EMA 導入前の古い資産）は通常重みへフォールバックする

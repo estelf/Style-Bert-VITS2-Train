@@ -22,7 +22,7 @@
 - G2P は `pyopenjtalk-plus`（numpy 2.x 向け事前ビルド済み wheel あり。旧 pyopenjtalk-dict 必要だったソースビルド/cmake/setuptools<81 制約は不要）。`[tsqyomi]` 追加で同形異音語の文脈読み選択、`[onnxruntime]` 追加で「何」読み推定が有効になる。GPU 環境では `uv sync` 前後に OS/CUDA に応じた torch を別途入れる（例: `uv pip install "torch" "torchaudio" --index-url https://download.pytorch.org/whl/cu128`）。
 - **実行に必要な依存は extras でなく dependency-groups**: `gui`（gradio）と `train`（pyannote.audio）は `[dependency-groups]` にあり、`[tool.uv] default-groups = ["dev", "gui", "train"]` で既定で入る。よって `uv sync` / `uv run` は**追加指定なしで全て揃う**（前処理 Step6 と試聴 GUI の依存含む）。extras に置いていた当時、`uv run` の自動 sync が「既定エクストラ＝無し」で環境を完全一致させ、gradio と pyopenjtalk-plus を黙って除去して壊れた（`import` は namespace package として成功するため実行時まで表面化しない）。実行中に環境を変えたくない長時間ジョブは `uv run --no-sync`、破損が疑わしいときは `uv pip install --reinstall --no-deps <pkg>`（torch を巻き込まない）。
 - 回帰テスト: `uv run pytest -v`（前処理→シード固定42の1エポック学習→合成→ゴールデン音声との相関差分検知。品質検証ではなく契約チェック）。
-  - テストデータセット・ゴールデン音声は git に含まれない。`tests/data/<モデル名>/` に配置しないとテストは skip される（clone 直後は存在しないのが正常）。デフォルトは `SBV2_TEST_MODEL=model_1`、差し替えは環境変数で。ゴールデン（`tests/references/`）は初回実行時に自動作成される。
+  - テストデータセット・ゴールデン音声は git に含まれない。`tests/data/<モデル名>/` に配置しないとテストは skip される（clone 直後は存在しないのが正常）。デフォルトは `SBV2_TEST_MODEL=test`、差し替えは環境変数で。ゴールデン（`tests/references/`）は初回実行時に自動作成される。
 - リンターは ruff（dev 依存済み。`[tool.ruff.lint].select = ["E4","E7","E9","F","I","UP"]`）、フォーマットは black（dev 依存済み）。実行は `uv run ruff check .` / `uv run black .`。
 
 ## 成果物の置き場

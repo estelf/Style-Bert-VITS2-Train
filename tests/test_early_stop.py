@@ -291,7 +291,7 @@ class TestSaveBestCheckpoint:
         assert (assets / "best.safetensors").read_bytes() == b"sentinel"
 
     def test_既定はEMA重みをbestにコピーする(self, tmp_path, monkeypatch):
-        # 同一 step 比較で EMA 重みの方が合成品質に優位（実測run 実測: 8/8 候補で UTMOS 優位、
+        # 同一 step 比較で EMA 重みの方が合成品質に優位（実測run: 8/8 候補で UTMOS 優位、
         # mel 相関 7/8 優位）。best step の選定は通常重みの検証損失で行ったまま、
         # 推論の1点だけ EMA 実体にする
         import train.pipeline as pipeline_mod
@@ -341,7 +341,7 @@ class TestRelativeMinDelta:
     min_delta=0.001 だけだとノイズの偶発更新で patience が永遠に発火せず epochs 上限まで
     走り続ける（小規模runの実測で確認した「プラトー検出しか停止しない」状態の回帰防止）。
     割合の既定も 0.5% → 1% に上げた。0.5% はノイズ帯（0.7σ）なので約4件に1件は運だけで
-    best が更新され、やはり patience が発火しなかった（実測run の eval_history で実測）。
+    best が更新され、やはり patience が発火しなかった（別run の eval_history で実測）。
     """
 
     # best=10.0 に対し ±0.3% 前後で揺れるだけの実質横ばい（単発最小は 9.98）
@@ -448,7 +448,7 @@ class TestWorseningStop:
     旧実装は |傾き|≦閾値（プラトー）のみ停止で、ノイズ帯を超えて悪化する run は
     プラトー判定では止まらなかった。best は保存済みなので悪化中の続行に益はなく、
     評価回数の少ない小規模データセットでは patience も発火しにくく epochs 上限まで
-    走りうる（小規模run/別run で kl・total が単調上昇した実測の空白地帯の修正）。
+    走りうる（小規模run2件で kl・total が単調上昇した実測の空白地帯の修正）。
     """
 
     # 横ばいから悪化に転じた履歴（窓5の傾き +0.3/評価、閾値は |平均|×0.002 ≒ +0.022）
@@ -498,14 +498,14 @@ class TestAdaptiveMinSteps:
     """early_stopping_min_steps=-1（自動）は max(1000, 5×1エポックのstep数) に解決される"""
 
     def test_autoは下限1000(self):
-        # 小規模run 相当: 152文 / batch_size 2 = 76 step/エポック → 5×76=380 < 1000 → 下限
+        # 小規模run（152文）: batch_size 2 = 76 step/エポック → 5×76=380 < 1000 → 下限
         hps = make_hps(early_stopping_min_steps=-1)
         assert _resolve_early_stopping_min_steps(hps, 76) == 1000
         # 解決値は hps へ書き戻される（以降の _early_stop_check / _best_eval_entry が参照）
         assert hps.train.early_stopping_min_steps == 1000
 
     def test_autoは5エポック相当(self):
-        # 大規模run 相当: 686文 / batch_size 2 = 343 step/エポック → 5×343=1715
+        # 大規模run（686文）: batch_size 2 = 343 step/エポック → 5×343=1715
         # （旧固定 3000 なら約9エポック。5エポックで判定開始を早める）
         hps = make_hps(early_stopping_min_steps=-1)
         assert _resolve_early_stopping_min_steps(hps, 343) == 1715

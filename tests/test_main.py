@@ -44,8 +44,8 @@ from style_bert_vits2.tts_model import TTSModel  # noqa: E402
 
 # 入れ替え可能なテストデータセット名（tests/data/<モデル名> を使う）
 MODEL_NAME = os.environ.get(
-    "SBV2_TEST_MODEL", "model_1"
-)  # デフォルトは model_1（tests/data/model_1/ に esd.list + raw.zip がある想定）
+    "SBV2_TEST_MODEL", "test"
+)  # デフォルトは test（tests/data/test/ に esd.list + raw.zip がある想定）
 DATASET_PATH = DATASET_ROOT / MODEL_NAME
 # 学習で保存され、推論に使うディレクトリ（config.json / style_vectors.npy / .safetensors）
 MODELS_PATH = ASSETS_ROOT / MODEL_NAME
